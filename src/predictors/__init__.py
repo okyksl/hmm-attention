@@ -36,10 +36,12 @@ def build_predictor(
     from src.teachers import HierarchicalTeacher, MultiLevelHierarchicalTeacher
 
     if kind == "classification":
-        if isinstance(teacher, MultiLevelHierarchicalTeacher):
-            return MultiLevelHierarchicalPredictor(teacher, argmax=argmax)
+        # HierarchicalTeacher is an L=1 subclass of MultiLevelHierarchicalTeacher,
+        # so check the more specific type first.
         if isinstance(teacher, HierarchicalTeacher):
             return HierarchicalPredictor(teacher, argmax=argmax)
+        if isinstance(teacher, MultiLevelHierarchicalTeacher):
+            return MultiLevelHierarchicalPredictor(teacher, argmax=argmax)
         return ClassificationPredictor(teacher, argmax=argmax)
     if kind == "regression":
         return RegressionPredictor(teacher, noise_std=noise_std)

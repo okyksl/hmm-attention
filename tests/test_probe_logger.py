@@ -112,17 +112,17 @@ def test_gather_positions_and_labels_alignment():
     labels = torch.randint(0, teacher.hidden_dim, (N, L_h))
 
     # slot=0, offset=0 → positions 0,2,4,6,8; chunks 0..4; all valid.
-    X, y = pl._gather(residual, labels, slot=0, offset=0)
+    X, y, _, _ = pl._gather_level(residual, labels, None, level=0, slot=0, offset=0)
     assert X.shape == (N * 5, D)
     assert y.shape == (N * 5,)
 
     # slot=1, offset=+1 → positions 1,3,5,7,9 → chunks 0..4 → +1 → 1..5.
     # Chunk 5 out of bounds (L_h=5), so 4 valid → drop last.
-    X, y = pl._gather(residual, labels, slot=1, offset=1)
+    X, y, _, _ = pl._gather_level(residual, labels, None, level=0, slot=1, offset=1)
     assert X.shape == (N * 4, D)
 
     # offset = -L_h → nothing valid.
-    X, y = pl._gather(residual, labels, slot=0, offset=-L_h)
+    X, y, _, _ = pl._gather_level(residual, labels, None, level=0, slot=0, offset=-L_h)
     assert X is None
 
 
@@ -141,15 +141,15 @@ def test_warm_start_recovers_perfect_features():
     # for (any layer, any slot, offset=0) should trivially learn identity.
     N, num_chunks = 8, 6
     data = _sample_data(teacher, batch=N, num_chunks=num_chunks)
-    labels = pl._decode_hidden(data)  # (N, L_h)
+    labels = pl._decode_level(data, 0)  # (N, L_h)
     T = num_chunks * teacher.chunk_size
     residual = F.one_hot(
         labels.repeat_interleave(teacher.chunk_size, dim=1), num_classes=teacher.hidden_dim
     ).float()  # (N, T, hidden_dim)
 
-    X, y = pl._gather(residual, labels, slot=1, offset=0)
+    X, y, _, _ = pl._gather_level(residual, labels, None, level=0, slot=1, offset=0)
     probe, _ = pl._ensure_probe(
-        layer=1, slot=1, offset=0, in_dim=X.shape[-1], device=X.device, need_opt=False
+        layer=1, slot=1, offset=0, in_dim=X.shape[-1], device=X.device, need_opt=False, level=0
     )
     pl._lbfgs_fit(probe, X, y)
     with torch.no_grad():
@@ -168,7 +168,7 @@ def test_sgd_step_improves_over_random_init():
 
     N, num_chunks = 32, 6
     data = _sample_data(teacher, batch=N, num_chunks=num_chunks)
-    labels = pl._decode_hidden(data)
+    labels = pl._decode_level(data, 0)
     T = num_chunks * teacher.chunk_size
     residual = F.one_hot(
         labels.repeat_interleave(teacher.chunk_size, dim=1), num_classes=teacher.hidden_dim
@@ -178,9 +178,9 @@ def test_sgd_step_improves_over_random_init():
     pl._current_residuals = tuple([(0, residual), (1, residual), (2, residual)])
     pl._current_data = data
 
-    # Baseline: random-init probe accuracy at (layer=1, slot=1, offset=0).
-    X, y = pl._gather(residual, labels, slot=1, offset=0)
-    probe, _ = pl._ensure_probe(1, 1, 0, X.shape[-1], X.device, need_opt=True)
+    # Baseline: random-init probe accuracy at (layer=1, level=0, slot=1, offset=0).
+    X, y, _, _ = pl._gather_level(residual, labels, None, level=0, slot=1, offset=0)
+    probe, _ = pl._ensure_probe(1, 1, 0, X.shape[-1], X.device, need_opt=True, level=0)
     with torch.no_grad():
         acc0 = (probe(X).argmax(dim=-1) == y).float().mean().item()
 

@@ -48,7 +48,7 @@ class _FakeWriter:
 def test_enabled_and_level_specs():
     teacher = _make_teacher(k=(2, 3), dims=(6, 4, 8))
     pl, _ = _logger(teacher)
-    assert pl.enabled and pl.multilevel
+    assert pl.enabled
     assert pl.num_levels == 2
     assert pl.level_arity == [2, 3]
     assert pl.level_alphabet == [6, 4]  # base + mid alphabets

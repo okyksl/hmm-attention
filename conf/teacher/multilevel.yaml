@@ -12,5 +12,10 @@ defaults:
 # selects a linear base (see conf/teacher/base_teacher/).
 _target_: src.teachers.MultiLevelHierarchicalTeacher.from_level_specs
 
-levels:                   # top -> bottom
-  - {chunk_dim: -1, chunk_size: 2, num_tuples: 1, chunk_seed: null}  # chunk_dim -1 -> dataset.dim (surface)
+levels:                   # top -> bottom; a genuinely multi-level default (a
+  # single level would just reproduce the `hierarchical` teacher). Each base
+  # token expands 2*3 = 6 surface tokens. chunk_dim -1 -> dataset.dim, so the
+  # intermediate alphabet defaults to the surface vocab; set it explicitly to
+  # decouple them. Note: full sequence length must be a multiple of prod(chunk_size).
+  - {chunk_dim: -1, chunk_size: 2, num_tuples: 1, chunk_seed: null}
+  - {chunk_dim: -1, chunk_size: 3, num_tuples: 1, chunk_seed: null}
