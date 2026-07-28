@@ -46,7 +46,7 @@ def tiny_teacher() -> LinearARTeacher:
         dim=4,
         window=2,
         span_lengths=[1, 1],
-        rank=4,
+        spectrum={'rank': 4},
         scale=5.0,
     )
 

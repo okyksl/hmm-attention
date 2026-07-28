@@ -28,5 +28,5 @@ dataset:
 hydra:
   sweeper:
     params:
-      teacher.multiplicative_constant: 1.8, 2.1
+      teacher.lag_spectrum.decay: 1.8, 2.1
       optimizer.lr: 0.008, 0.002

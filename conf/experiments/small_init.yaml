@@ -15,7 +15,7 @@ student:
   value_init_scale: 0.
 
 teacher:
-  orthogonal_matrices: true
+  orthogonality: gram_schmidt
 
 misc:
   wandb:

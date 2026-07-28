@@ -33,9 +33,9 @@ def test_hierarchical_teacher():
     base = LinearARTeacher.from_parameters(
         dim=hidden_dim,
         span_lengths=span_lengths,
-        rank=hidden_dim,
+        spectrum={'rank': hidden_dim},
         window=window,
-        multiplicative_constant=1.7,
+        lag_spectrum={'law': 'geometric', 'decay': 1.7},
         scale=10.0,  # equivalent to temperature=0.1 in the old design
     )
     ht = HierarchicalTeacher(
@@ -197,9 +197,9 @@ def test_chunk_generation_uses_full_cartesian_product():
     base = LinearARTeacher.from_parameters(
         dim=hidden_dim,
         span_lengths=[1],
-        rank=hidden_dim,
+        spectrum={'rank': hidden_dim},
         window=1,
-        multiplicative_constant=1.0,
+        lag_spectrum={'law': 'geometric', 'decay': 1.0},
         scale=1.0,
     )
 
@@ -241,9 +241,9 @@ def test_hierarchical_teacher_stochastic():
     base = LinearARTeacher.from_parameters(
         dim=hidden_dim,
         span_lengths=span_lengths,
-        rank=hidden_dim,
+        spectrum={'rank': hidden_dim},
         window=window,
-        multiplicative_constant=1.7,
+        lag_spectrum={'law': 'geometric', 'decay': 1.7},
         # High scale -> the hidden posterior is effectively a delta on the
         # realized (argmax) hidden id, so the only residual slot-1 uncertainty
         # comes from within-hidden-id slot-0 collisions (see S4).

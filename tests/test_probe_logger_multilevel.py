@@ -12,8 +12,8 @@ from src.trainer.probe_logger import ProbeLogger
 
 def _make_teacher(k=(2, 3), dims=(6, 4, 8), tuples=(1, 1), base_window=2, seed=0):
     base = LinearARTeacher.from_parameters(
-        dim=dims[0], span_lengths=[1] * base_window, rank=dims[0],
-        window=base_window, multiplicative_constant=1.7, scale=10.0,
+        dim=dims[0], span_lengths=[1] * base_window, spectrum={"rank": dims[0]},
+        window=base_window, lag_spectrum={"law": "geometric", "decay": 1.7}, scale=10.0,
     )
     levels = [
         ChunkCode(in_dim=dims[l], out_dim=dims[l + 1], size=k[l],

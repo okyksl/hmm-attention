@@ -19,9 +19,9 @@ def _make_teacher(
     base = LinearARTeacher.from_parameters(
         dim=hidden_dim,
         span_lengths=[1] * window,
-        rank=hidden_dim,
+        spectrum={'rank': hidden_dim},
         window=window,
-        multiplicative_constant=1.7,
+        lag_spectrum={'law': 'geometric', 'decay': 1.7},
         scale=10.0,
     )
     return HierarchicalTeacher(

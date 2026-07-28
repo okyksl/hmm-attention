@@ -26,8 +26,8 @@ def _base_cfg():
     return OmegaConf.create(
         {
             "dataset": {"dim": 16, "window": 3, "length": 20},
-            "teacher": {"dim": -1, "rank": -1, "window": -1},
-            "student": {"dim": -1, "rank": -1, "window": -1, "hidden_dim": -1},
+            "teacher": {"dim": -1, "window": -1},
+            "student": {"dim": -1, "window": -1, "hidden_dim": -1},
         }
     )
 
@@ -36,7 +36,6 @@ def test_preprocess_cfg_resolves_teacher_sentinels():
     cfg = _base_cfg()
     preprocess_cfg(cfg)
     assert cfg.teacher.dim == cfg.dataset.dim  # -1 → dataset.dim
-    assert cfg.teacher.rank == cfg.teacher.dim
     assert cfg.teacher.window == cfg.dataset.window
 
 
@@ -44,16 +43,23 @@ def test_preprocess_cfg_resolves_student_sentinels():
     cfg = _base_cfg()
     preprocess_cfg(cfg)
     assert cfg.student.dim == cfg.dataset.dim
-    assert cfg.student.rank == cfg.student.dim
     assert cfg.student.window == cfg.teacher.window
     assert cfg.student.hidden_dim == cfg.student.dim
 
 
 def test_preprocess_cfg_preserves_explicit_values():
     cfg = _base_cfg()
-    cfg.teacher.rank = 8
+    cfg.teacher.dim = 8
     preprocess_cfg(cfg)
-    assert cfg.teacher.rank == 8
+    assert cfg.teacher.dim == 8
+
+
+def test_preprocess_cfg_leaves_spectrum_rank_sentinel_to_src_spectra():
+    # `rank: -1` resolves against the spectrum length at construction, not here.
+    cfg = _base_cfg()
+    cfg.teacher.spectrum = {"rank": -1}
+    preprocess_cfg(cfg)
+    assert cfg.teacher.spectrum.rank == -1
 
 
 def test_preprocess_cfg_merges_ngram_on_top_of_student():

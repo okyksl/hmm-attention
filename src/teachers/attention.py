@@ -1,14 +1,20 @@
 from contextlib import contextmanager
-from typing import List, Optional
+from typing import Any, List, Mapping, Optional, Sequence, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from src import spectra
 from src.model.attention import generate_square_subsequent_mask
 from src.model.decoder import DecoderBlock
 from src.model.positional import PositionalEncoding
+from src.spectra import SpectrumSpec
 from src.teachers.base import ADAPTIVE, ARTeacher
+
+# Linear maps of the teacher whose singular values can be shaped by `spectrum`.
+SPECTRUM_TARGETS = ("encoder", "readout", "query", "key", "value", "output", "mlp")
+DEFAULT_SPECTRUM_TARGETS = ("encoder", "readout", "query", "key", "value", "output")
 
 
 @contextmanager
@@ -80,6 +86,8 @@ class AttentionARTeacher(ARTeacher):
         layer_normalization: bool = True,
         attention_disentanglement: bool = False,
         attention_bias: bool = True,
+        spectrum: Union[SpectrumSpec, Mapping[str, Any], None] = None,
+        spectrum_targets: Sequence[str] = DEFAULT_SPECTRUM_TARGETS,
         seed: Optional[int] = None,
         freeze: bool = True,
     ) -> None:
@@ -156,12 +164,62 @@ class AttentionARTeacher(ARTeacher):
             nn.init.orthogonal_(self.readout.weight)
             self.readout.weight.data.mul_(init_scale)
 
+            # Optional feature spectrum. Left off (`spectrum: null`) the teacher
+            # keeps its default init exactly; supplied, it reshapes the singular
+            # values of the selected linear maps, so the process has a graded
+            # rather than flat feature importance profile.
+            self.spectrum_spec = (
+                SpectrumSpec.from_config(spectrum) if spectrum is not None else None
+            )
+            self.spectrum_targets = tuple(spectrum_targets)
+            if self.spectrum_spec is not None:
+                self._apply_spectrum(self.spectrum_spec, self.spectrum_targets, init_scale)
+
         # A teacher is a fixed process: freeze params and disable dropout/train
         # behaviour. Params are never handed to the optimizer regardless, but
         # freezing makes the "fixed data-generating process" contract explicit.
         if freeze:
             self.requires_grad_(False)
         self.eval()
+
+    # --- spectrum shaping ---
+    def _spectrum_modules(self, target: str) -> List[nn.Linear]:
+        """The `nn.Linear`s behind a target name (may be empty if projections
+        are disabled, or several when heads are disentangled)."""
+        attn = self.block.self_attention
+        lookup = {
+            "encoder": self.encoder,
+            "readout": self.readout,
+            "query": attn.query_proj,
+            "key": attn.key_proj,
+            "value": attn.value_proj,
+            "output": attn.out_proj,
+            "mlp": nn.ModuleList([self.block.linear1, self.block.linear2]),
+        }
+        if target not in lookup:
+            raise ValueError(
+                f"unknown spectrum target {target!r}; expected one of {SPECTRUM_TARGETS}"
+            )
+        module = lookup[target]
+        candidates = list(module) if isinstance(module, nn.ModuleList) else [module]
+        return [m for m in candidates if isinstance(m, nn.Linear)]
+
+    def _apply_spectrum(
+        self, spec: SpectrumSpec, targets: Sequence[str], init_scale: float
+    ) -> None:
+        """Re-draw the selected weight matrices with singular values from `spec`.
+
+        Each weight keeps its shape; the spectrum is materialized at
+        `min(out_features, in_features)` and the matrix is scaled by
+        `init_scale`, matching the default init's convention.
+        """
+        with torch.no_grad():
+            for target in targets:
+                for module in self._spectrum_modules(target):
+                    out_f, in_f = module.weight.shape
+                    s = spectra.spectrum(spec, min(out_f, in_f))
+                    w = spectra.random_matrix_with_spectrum(s, out_f, in_f)
+                    module.weight.copy_(w * init_scale)
 
     # --- ARTeacher interface ---
     @property

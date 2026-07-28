@@ -8,7 +8,7 @@ defaults:
 student:
   window: 1
   span_lengths: [2]
-  multiplicative_constant: 1.0
+  lag_spectrum: {law: flat}
 
 trainer:
   epochs: 500

@@ -2,6 +2,7 @@ import logging
 
 import torch
 
+from src.spectra import effective_rank
 from src.teachers import LinearARTeacher
 
 
@@ -37,3 +38,14 @@ def _log_summary(role: str, model: LinearARTeacher, params: torch.Tensor) -> Non
         f"Operator norm/norm^2: {torch.linalg.norm(flat, ord=2)}, "
         f"{torch.linalg.norm(flat, ord=2) ** 2}"
     )
+
+    # Spectrum structure: the outer law's per-lag weights and the inner law's
+    # realized singular values (top-8) plus their participation ratio.
+    logger.info(f"{role} lag spectrum: {model.lag_spectrum_spec}")
+    logger.info(f"{role} lag weights: {model.lag_weights.tolist()}")
+    logger.info(f"{role} feature spectrum: {model.spectrum_specs[0]}")
+    for lag_idx, s in enumerate(model.singular_values):
+        logger.info(
+            f"  lag {lag_idx}: eff. rank {effective_rank(s):.2f}, "
+            f"top-8 singular values {[round(v, 4) for v in s[:8].tolist()]}"
+        )

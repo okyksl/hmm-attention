@@ -22,11 +22,10 @@ def preprocess_cfg(cfg: DictConfig) -> DictConfig:
     corresponding upstream default, and merges ngram configs on top of the
     student config so they inherit its architecture.
     """
-    # teacher
+    # teacher. Spectrum `rank: -1` needs no resolution here — `src.spectra`
+    # resolves it against the spectrum length at construction.
     if "dim" in cfg.teacher:
         cfg.teacher.dim = _resolve_sentinel(cfg.teacher.dim, cfg.dataset.dim)
-    if "rank" in cfg.teacher:
-        cfg.teacher.rank = _resolve_sentinel(cfg.teacher.rank, cfg.teacher.dim)
     if "window" in cfg.teacher:
         cfg.teacher.window = _resolve_sentinel(cfg.teacher.window, cfg.dataset.window)
     if "hidden_dim" in cfg.teacher:
@@ -44,8 +43,6 @@ def preprocess_cfg(cfg: DictConfig) -> DictConfig:
     # student
     if "student" in cfg:
         cfg.student.dim = _resolve_sentinel(cfg.student.dim, cfg.dataset.dim)
-        if "rank" in cfg.student:
-            cfg.student.rank = _resolve_sentinel(cfg.student.rank, cfg.student.dim)
         if "window" in cfg.student:
             cfg.student.window = _resolve_sentinel(
                 cfg.student.window, cfg.teacher.window

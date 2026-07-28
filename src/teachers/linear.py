@@ -1,12 +1,15 @@
 import warnings
-from typing import List, Optional
+from typing import Any, List, Mapping, Optional, Sequence, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from src import spectra
+from src.spectra import SpectrumSpec
 from src.teachers.base import ARTeacher
-from src.utils import random_orthogonal_matrices, random_unit_norm_matrix
+
+SpectrumConfig = Union[SpectrumSpec, Mapping[str, Any], None]
 
 
 class LinearARTeacher(ARTeacher):
@@ -18,6 +21,11 @@ class LinearARTeacher(ARTeacher):
     and computes a linear combination of the per-span aggregates using
     per-lag weight matrices `_params[i]` shape `(dim, dim)`. Optionally, a
     `stride` schedule places span start positions with overlap.
+
+    Each weight matrix is generated as `A_i = scale · w_i · U_i diag(ŝ_i) V_iᵀ`
+    (see `src.spectra`): an **inner** spectrum `ŝ_i` — normalized, so it only
+    sets the *shape* of the feature importances — scaled by an **outer**
+    per-lag weight `w_i` that sets the matrix norm.
 
     `next_token_log_probs` returns log-probabilities (log-softmax of the raw
     linear output). Distribution sharpness is controlled by the `scale`
@@ -31,12 +39,13 @@ class LinearARTeacher(ARTeacher):
         span_lengths: List[int],
         stride: Optional[int] = None,
         span_position_weights: Optional[List[float]] = None,
-        rank: Optional[int] = None,
         scale: float = 1.0,
-        multiplicative_constant: float = 1.0,
-        reverse_constants: bool = True,
-        shared_matrix_across_lags: bool = False,
-        orthogonal_matrices: bool = False,
+        singular_values: Optional[torch.Tensor] = None,
+        lag_weights: Optional[torch.Tensor] = None,
+        spectrum_specs: Optional[Sequence[SpectrumSpec]] = None,
+        lag_spectrum_spec: Optional[SpectrumSpec] = None,
+        shared_bases: bool = False,
+        orthogonality: str = "none",
     ) -> None:
         super().__init__()
         window, dim, dim2 = params.shape
@@ -57,17 +66,31 @@ class LinearARTeacher(ARTeacher):
         )
 
         # Metadata (preserved for verbose logging / analysis; not used in forward).
-        self.rank = rank if rank is not None else dim
         self.scale = scale
-        self.multiplicative_constant = multiplicative_constant
-        self.reverse_constants = reverse_constants
-        self.shared_matrix_across_lags = shared_matrix_across_lags
-        self.orthogonal_matrices = orthogonal_matrices
+        self.spectrum_specs = list(spectrum_specs) if spectrum_specs else [SpectrumSpec()] * window
+        self.lag_spectrum_spec = lag_spectrum_spec or SpectrumSpec(normalize="none")
+        self.shared_bases = shared_bases
+        self.orthogonality = orthogonality
+        self.register_buffer(
+            "singular_values",
+            singular_values if singular_values is not None else torch.ones(window, dim),
+            persistent=False,
+        )
+        self.register_buffer(
+            "lag_weights",
+            lag_weights if lag_weights is not None else torch.ones(window),
+            persistent=False,
+        )
 
     # --- ARTeacher interface ---
     @property
     def dim(self) -> int:
         return self._dim
+
+    @property
+    def rank(self) -> int:
+        """Largest number of non-zero singular values across the lag matrices."""
+        return int((self.singular_values > 0).sum(dim=-1).max())
 
     @property
     def context_length(self) -> int:
@@ -134,24 +157,29 @@ class LinearARTeacher(ARTeacher):
         if k <= 0 or k > self._window:
             raise ValueError(f"k={k} must be in [1, window={self._window}]")
 
-        if self.reverse_constants:
-            params = self._params[:k]
-            span_lengths = self._span_lengths[:k]
+        # Keep the contiguous end carrying the most outer weight — the lags the
+        # process actually relies on. For a monotone outer law this is just
+        # "drop the tail of the decay".
+        # Ties (a flat outer law) fall through to the most recent spans, the
+        # usual order-k Markov restriction.
+        w = self.lag_weights
+        if float(w[:k].sum()) > float(w[self._window - k :].sum()):
+            sl = slice(None, k)
         else:
-            params = self._params[-k:]
-            span_lengths = self._span_lengths[-k:]
+            sl = slice(self._window - k, None)
 
         return LinearARTeacher(
-            params=params,
-            span_lengths=span_lengths,
+            params=self._params[sl],
+            span_lengths=self._span_lengths[sl],
             stride=self._stride,
             span_position_weights=self._span_position_weights,
-            rank=self.rank,
             scale=self.scale,
-            multiplicative_constant=self.multiplicative_constant,
-            reverse_constants=self.reverse_constants,
-            shared_matrix_across_lags=self.shared_matrix_across_lags,
-            orthogonal_matrices=self.orthogonal_matrices,
+            singular_values=self.singular_values[sl],
+            lag_weights=self.lag_weights[sl],
+            spectrum_specs=self.spectrum_specs[sl],
+            lag_spectrum_spec=self.lag_spectrum_spec,
+            shared_bases=self.shared_bases,
+            orthogonality=self.orthogonality,
         )
 
     # --- Constructor helpers ---
@@ -160,21 +188,34 @@ class LinearARTeacher(ARTeacher):
         cls,
         dim: int,
         span_lengths: List[int],
-        rank: int = 1,
         window: int = 1,
         scale: float = 1.0,
-        multiplicative_constant: float = 1.0,
-        reverse_constants: bool = True,
-        shared_matrix_across_lags: bool = False,
-        orthogonal_matrices: bool = False,
+        spectrum: SpectrumConfig = None,
+        lag_spectrum: SpectrumConfig = None,
+        shared_bases: bool = False,
+        orthogonality: str = "none",
         stride: Optional[int] = None,
         span_position_weights: Optional[List[float]] = None,
     ) -> "LinearARTeacher":
+        """Build a teacher from an inner (feature) and outer (lag) spectrum.
+
+        Args:
+            spectrum: inner singular-value law, applied within each lag matrix.
+                Normalized (`normalize='spectral'` by default), so it sets the
+                shape of the feature importances, not the norm. `law`, `decay`,
+                `alpha`, and `rank` may each be a length-`window` list to vary
+                the spectrum per lag.
+            lag_spectrum: outer law over lags. Un-normalized by default, so
+                `w_i` literally sets lag `i`'s matrix norm. `reverse=True` puts
+                the largest weight on the last (most recent) span.
+            shared_bases: reuse one (U, V) pair across lags, so the matrices
+                differ only through their singular values.
+            orthogonality: `none`, `disjoint` (spectrum-preserving mutual
+                Frobenius-orthogonality), or `gram_schmidt`. See `src.spectra`.
+        """
         assert dim > 0, f"Dimension {dim} must be positive"
-        assert rank > 0, f"Rank {rank} must be positive"
         assert window > 0, f"Window {window} must be positive"
         assert scale > 0, f"Scale {scale} must be positive"
-        assert rank <= dim, f"Rank {rank} must be less than or equal to dim {dim}"
 
         if stride is not None:
             assert stride > 0, f"Stride {stride} must be positive"
@@ -203,21 +244,26 @@ class LinearARTeacher(ARTeacher):
                 )
             span_position_weights = [w / weight_sum for w in span_position_weights]
 
-        if shared_matrix_across_lags:
-            base_matrix = random_unit_norm_matrix(dim, rank)
-            matrices = [base_matrix] * window
-        elif orthogonal_matrices:
-            matrices = random_orthogonal_matrices(window, dim, rank)
-        else:
-            matrices = [random_unit_norm_matrix(dim, rank) for _ in range(window)]
-
-        constants = [
-            multiplicative_constant**i
-            for i in (reversed(range(window)) if reverse_constants else range(window))
-        ]
-        A = torch.stack(
-            [matrix * const for matrix, const in zip(matrices, constants)], dim=0
+        # Inner: one normalized singular-value profile per lag.
+        specs = spectra.expand_specs(spectrum, window)
+        for spec in specs:
+            if spec.rank != -1 and spec.rank > dim:
+                raise ValueError(f"spectrum rank {spec.rank} must be <= dim {dim}")
+        matrices = spectra.random_matrices(
+            n=window,
+            dim=dim,
+            specs=specs,
+            shared_bases=shared_bases,
+            orthogonality=orthogonality,
         )
+
+        # Outer: one scalar per lag, setting each matrix's norm.
+        lag_spec = spectra.SpectrumSpec.from_config(
+            lag_spectrum if lag_spectrum is not None else {"normalize": "none"}
+        )
+        lag_weights = spectra.spectrum(lag_spec, window)
+
+        A = torch.stack([m * w for m, w in zip(matrices, lag_weights)], dim=0)
         A *= scale
 
         return cls(
@@ -225,10 +271,11 @@ class LinearARTeacher(ARTeacher):
             span_lengths=span_lengths,
             stride=stride,
             span_position_weights=span_position_weights,
-            rank=rank,
             scale=scale,
-            multiplicative_constant=multiplicative_constant,
-            reverse_constants=reverse_constants,
-            shared_matrix_across_lags=shared_matrix_across_lags,
-            orthogonal_matrices=orthogonal_matrices,
+            singular_values=torch.stack([spectra.spectrum(s, dim) for s in specs]),
+            lag_weights=lag_weights,
+            spectrum_specs=specs,
+            lag_spectrum_spec=lag_spec,
+            shared_bases=shared_bases,
+            orthogonality=orthogonality,
         )

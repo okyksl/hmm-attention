@@ -14,6 +14,6 @@ hydra:
       student.num_blocks: 2
       dataset.number.train: 27000 # instead of 9000 (more params. needs more data)
       teacher.span_lengths: [4, 4, 4] # instead of [2, 2, 2]
-      teacher.multiplicative_constant: 1.8 # instead of 1.7
+      teacher.lag_spectrum.decay: 1.8 # instead of 1.7
       optimizer.lr: 0.04 # instead of 0.08
       

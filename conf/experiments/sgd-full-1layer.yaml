@@ -15,7 +15,7 @@ trainer:
 
 teacher:
   span_lengths: [4, 4, 4]
-  multiplicative_constant: 2.0
+  lag_spectrum: {law: geometric, decay: 2.0}
 
 student:
   attention_bias: false

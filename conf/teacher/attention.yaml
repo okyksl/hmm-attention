@@ -30,5 +30,12 @@ layer_normalization: true
 attention_disentanglement: false
 attention_bias: true
 
+# Optional feature spectrum over the teacher's frozen linear maps (same laws as
+# conf/teacher/linear.yaml). null keeps the default init untouched; set it to
+# give the process a graded rather than flat feature importance profile, e.g.
+#   spectrum: {law: power, alpha: 1.0, normalize: spectral}
+spectrum: null
+spectrum_targets: [encoder, readout, query, key, value, output]  # + mlp
+
 seed: null                  # set for a reproducible random teacher
 freeze: true

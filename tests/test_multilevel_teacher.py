@@ -30,9 +30,9 @@ def _linear_base(dim, window, scale=10.0, seed=0):
     return LinearARTeacher.from_parameters(
         dim=dim,
         span_lengths=[1] * window,
-        rank=dim,
+        spectrum={'rank': dim},
         window=window,
-        multiplicative_constant=1.7,
+        lag_spectrum={'law': 'geometric', 'decay': 1.7},
         scale=scale,
     )
 

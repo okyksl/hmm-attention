@@ -1,12 +1,40 @@
 _target_: src.teachers.LinearARTeacher.from_parameters
 dim: -1
-rank: -1
 window: -1
-scale: 1
-multiplicative_constant: 1.7
-reverse_constants: false
-shared_matrix_across_lags: false
-orthogonal_matrices: false
+scale: 1                # softmax temperature = 1/scale (sharpness)
+
+# Inner (feature) spectrum: the singular values *inside* each lag matrix.
+# Normalized, so it only sets the shape of the feature importances — the outer
+# law below sets the norm. `law`, `decay`, `alpha` and `rank` may each be given
+# as a length-`window` list to vary the spectrum per lag (e.g. rank: [8, 4, 2]).
+spectrum:
+  law: flat             # flat | geometric (decay^k) | power ((k+1)^-alpha)
+  decay: 1.0            # law=geometric
+  alpha: 1.0            # law=power
+  rank: -1              # keep the top-`rank` singular values; -1 -> dim
+  normalize: spectral   # spectral (max=1) | frobenius (L2=1) | sum | none
+  reverse: false
+
+# Outer (lag) importance scores: one scalar per lag, setting each matrix's norm.
+# Un-normalized, so these are absolute. reverse=true puts the largest weight on
+# the last (most recent) span.
+lag_spectrum:
+  law: geometric
+  decay: 1.7
+  alpha: 1.0
+  rank: -1              # -1 -> window (a hard lag cutoff)
+  normalize: none
+  reverse: false
+
+shared_bases: false     # reuse one (U, V) pair across lags -> same features,
+                        # different importance (only meaningful with a per-lag
+                        # `spectrum`); replaces shared_matrix_across_lags.
+orthogonality: none     # none | disjoint | gram_schmidt
+                        #   disjoint     - mutually Frobenius-orthogonal AND
+                        #                  spectrum-preserving; needs sum(rank) <= dim
+                        #   gram_schmidt - orthogonal in R^{d*d}; does NOT preserve
+                        #                  the prescribed singular values
+
 span_lengths: [2, 2, 2]
 stride: null  # stride between interval start positions; null = non-overlapping (sum of span_lengths)
 span_position_weights: null  # e.g., [0.7, 0.3] for weighted positions within each span
