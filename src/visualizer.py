@@ -573,6 +573,15 @@ def log_attention_alignment(
     for h, norm in enumerate(student_norms):
         log_dict[f"attn/{layer_name}/align_norm_head{h + 1}/{split}"] = norm
 
+    # All-pairs cosine similarity as *scalars* too, not just the heatmap image.
+    # This is the scale-free counterpart of `span_mass`, and the series that
+    # `src/analysis/head_phases.py` reads to infer which head owns which span.
+    for h in range(num_heads):
+        for k in range(num_spans):
+            log_dict[
+                f"attn/{layer_name}/align_cos_sim_head{h + 1}_span{k + 1}/{split}"
+            ] = float(cos_sim_mat[h, k])
+
     # Heatmap: cosine similarity (all pairs).
     log_dict[f"attn/{layer_name}/align_cos_sim/{split}"] = _heatmap_image(
         cos_sim_mat,
