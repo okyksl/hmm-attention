@@ -1,17 +1,25 @@
+# --- Python ---
 __pycache__/
-results/
-figures/fig1/results/
-figures/init-scales-ablation/results/
-figures/.cache/
-outputs/
-results.csv
+*.pyc
+.venv/
+.ipynb_checkpoints/
+
+# --- OS / editor / local-only ---
 .DS_Store
 .env
-notebooks/
-artifacts/
 CLAUDE.md
-.venv/
-*.pyc
-analysis/figures/
+
+# --- Run outputs (Hydra single runs, sweeps, wandb, downloaded artifacts) ---
+outputs/
 multirun/
-figures/*.pdf
+artifacts/
+wandb/
+
+# --- Generated results & figures (regenerate from the notebooks; never commit) ---
+# Matches any `results/`, `figures/` or `.cache/` output dir at any depth, so a new
+# notebook gets this for free instead of needing its own rule.
+**/results/
+**/figures/
+**/.cache/
+results.csv
+*.pdf

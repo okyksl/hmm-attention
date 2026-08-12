@@ -19,8 +19,10 @@ from typing import Dict, Any, List, Sequence, Optional, Union
 import matplotlib.colors as mcolors
 from matplotlib.patches import Rectangle
 
-DEFAULT_ENTITY = "r-alvarezlucendo16"
-DEFAULT_PROJECT = "incremental-learning"
+# Must match conf/misc/default.yaml — a wrong target returns an empty frame with
+# no error, which reads as "no runs matched" rather than "wrong project".
+DEFAULT_ENTITY = "okyksl"
+DEFAULT_PROJECT = "hmm-attention"
 
 REPORT_BLUE = "#1f77b4"
 REPORT_YELLOW = "#ff7f0e"

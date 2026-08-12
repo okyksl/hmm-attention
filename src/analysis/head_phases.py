@@ -19,7 +19,7 @@ hypothesis under test is that heads acquire spans in decreasing importance.
 
 Typical use:
 
-    from analysis.utils import fetch_runs, get_runs_data
+    from notebooks.utils import fetch_runs, get_runs_data
     from src.analysis.head_phases import metric_keys, phase_table
 
     runs = fetch_runs(tags_any=["power-spectrum-grid"])
@@ -342,7 +342,7 @@ def phase_table(
 ) -> pd.DataFrame:
     """One row per run: assignment, per-span acquisition step, and order match.
 
-    `df` is the frame returned by `analysis.utils.get_runs_data`, which carries
+    `df` is the frame returned by `notebooks.utils.get_runs_data`, which carries
     both history and flattened config columns.
     """
     rows = []

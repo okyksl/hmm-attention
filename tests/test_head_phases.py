@@ -1,6 +1,6 @@
 """Unit tests for `src.analysis.head_phases` (the automated specialization read-out).
 
-Uses synthetic history frames shaped exactly like `analysis.utils.get_runs_data`
+Uses synthetic history frames shaped exactly like `notebooks.utils.get_runs_data`
 output, so the logic is verified without touching wandb.
 """
 
