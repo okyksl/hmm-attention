@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np
 from pathlib import Path
-from typing import Dict, Any, List, Sequence, Optional, Union
+from typing import Dict, Any, List, Mapping, Sequence, Optional, Tuple, Union
 import matplotlib.colors as mcolors
 from matplotlib.patches import Rectangle
 
@@ -169,6 +169,18 @@ def fetch_run_data(
     }
 
 
+def fetch_run_config(
+    run_id: str,
+    entity: str = DEFAULT_ENTITY,
+    project: str = DEFAULT_PROJECT,
+    api: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Fetch and normalize a run configuration."""
+    client = api or wandb.Api()
+    run = client.run(f"{entity}/{project}/{run_id}")
+    return _config_to_dict(run.config)
+
+
 def get_runs_data(
     runs: Sequence[wandb.apis.public.Run],
     metrics: Sequence[str],
@@ -249,6 +261,157 @@ def get_table(
         raise ValueError(f"No table '{table_key}' in artifact {artifact_path}:v{step}")
 
     return pd.DataFrame(data=table.data, columns=table.columns)
+
+
+def attention_table_key(layer: str = "L1", split: str = "val") -> str:
+    """W&B key for averaged attention activations (not model parameters)."""
+    return f"attn/{layer}/weights/{split}"
+
+
+def fetch_attention_tables(
+    run_id: str,
+    steps: Sequence[int],
+    layer: str = "L1",
+    split: str = "val",
+    entity: str = DEFAULT_ENTITY,
+    project: str = DEFAULT_PROJECT,
+    cache_dir: Union[str, Path] = "notebooks/.cache/attention",
+    api: Optional[Any] = None,
+) -> Dict[int, pd.DataFrame]:
+    """Download numerical attention tables for exact training steps.
+
+    Table artifact version numbers are deliberately ignored: resume/retry
+    behavior can make them diverge from training steps.  Instead, history is
+    scanned once and each row's recorded run-file path is downloaded.  Files
+    are cached locally so re-rendering figures does not repeat network I/O.
+    """
+    requested = [int(step) for step in steps]
+    if not requested:
+        return {}
+    client = api or wandb.Api()
+    run = client.run(f"{entity}/{project}/{run_id}")
+    key = attention_table_key(layer, split)
+    references = {
+        int(row["_step"]): row[key]
+        for row in run.scan_history(keys=["_step", key])
+        if row.get(key) is not None
+    }
+    missing = sorted(set(requested) - references.keys())
+    if missing:
+        available = sorted(references)
+        raise ValueError(
+            f"no {key!r} table at steps {missing}; available steps: {available}"
+        )
+
+    root = Path(cache_dir) / run_id
+    tables: Dict[int, pd.DataFrame] = {}
+    for step in requested:
+        reference = references[step]
+        relative_path = Path(reference["path"])
+        cached_path = root / relative_path
+        if not cached_path.exists():
+            downloaded = run.file(reference["path"]).download(
+                root=str(root), replace=True
+            )
+            cached_path = Path(downloaded.name)
+        with cached_path.open() as handle:
+            payload = json.load(handle)
+        tables[step] = pd.DataFrame(
+            data=payload["data"], columns=payload["columns"]
+        )
+    return tables
+
+
+def fetch_step_metrics(
+    run_id: str,
+    steps: Sequence[int],
+    metrics: Sequence[str],
+    entity: str = DEFAULT_ENTITY,
+    project: str = DEFAULT_PROJECT,
+    api: Optional[Any] = None,
+) -> Dict[int, Dict[str, Any]]:
+    """Fetch exact, unsampled scalar history rows for post-training plots."""
+    requested = {int(step) for step in steps}
+    if not requested:
+        return {}
+    client = api or wandb.Api()
+    run = client.run(f"{entity}/{project}/{run_id}")
+    keys = list(dict.fromkeys(["_step", *metrics]))
+    rows: Dict[int, Dict[str, Any]] = {}
+    for row in run.scan_history(keys=keys):
+        step = int(row["_step"])
+        if step not in requested:
+            continue
+        # Older code issued several run.log calls with the same explicit step.
+        # Merge their sparse rows so legacy numerical histories remain usable.
+        target = rows.setdefault(step, {"_step": step})
+        target.update(
+            {key: value for key, value in row.items() if value is not None}
+        )
+    missing = sorted(requested - rows.keys())
+    if missing:
+        raise ValueError(f"no scalar history rows at steps {missing}")
+    return rows
+
+
+def value_alignment_keys(
+    num_heads: int,
+    num_teacher: int,
+    layer: str = "L1",
+    split: str = "val",
+) -> Tuple[List[str], List[str]]:
+    """Return value-norm and value-cosine keys needed for heatmaps."""
+    norm_keys = [
+        f"attn/{layer}/value_norm_head{head + 1}/{split}"
+        for head in range(num_heads)
+    ]
+    cosine_keys = [
+        f"attn/{layer}/value_cos_head{head + 1}_teacher{teacher + 1}/{split}"
+        for head in range(num_heads)
+        for teacher in range(num_teacher)
+    ]
+    return norm_keys, cosine_keys
+
+
+def value_alignment_from_metrics(
+    metrics: Mapping[str, Any],
+    num_heads: int,
+    num_teacher: int,
+    layer: str = "L1",
+    split: str = "val",
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Reconstruct value norms and cosine matrix from one history row."""
+    norm_keys, cosine_keys = value_alignment_keys(
+        num_heads, num_teacher, layer, split
+    )
+    missing = [key for key in norm_keys + cosine_keys if metrics.get(key) is None]
+    if missing:
+        raise ValueError(
+            f"value alignment is unavailable; missing {len(missing)} keys, "
+            f"for example {missing[0]!r}"
+        )
+    norms = np.asarray([metrics[key] for key in norm_keys], dtype=np.float32)
+    cosine = np.asarray(
+        [metrics[key] for key in cosine_keys], dtype=np.float32
+    ).reshape(num_heads, num_teacher)
+    return norms, cosine
+
+
+def probe_metric_keys(
+    level: int,
+    offset: int,
+    metric: str,
+    num_layers: int,
+    num_slots: int,
+    split: str = "val",
+) -> List[str]:
+    """Return scalar keys needed to rebuild one probe summary heatmap."""
+    offset_name = f"k+{offset}" if offset > 0 else f"k{offset}"
+    return [
+        f"probe/L{layer}/level{level}/slot{slot}/{offset_name}/{metric}/{split}"
+        for layer in range(num_layers)
+        for slot in range(num_slots)
+    ]
 
 
 # ============================================================================

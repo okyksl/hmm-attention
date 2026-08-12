@@ -359,7 +359,9 @@ class Trainer(ABC):
                 self.probe_logger.collect_val_batch()
                 attn_batches.append(attn_weights)
         self.attention_logger.log(step, "val", attn_batches)
-        with prof.cuda("probe_log"):
+        # Measure end-to-end wall time, including probe computation, device
+        # synchronization from scalar extraction, and W&B enqueueing.
+        with prof.cpu("probe_log"):
             self.probe_logger.log(step, "val")
 
     def _val_ngram(self) -> None:

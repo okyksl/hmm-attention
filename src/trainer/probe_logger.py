@@ -29,13 +29,9 @@ from __future__ import annotations
 import logging
 from typing import Dict, List, Optional, Tuple
 
-import matplotlib.pyplot as plt
-import numpy as np
-import seaborn as sns
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import wandb
 
 from src.model import TransformerDecoder
 from src.teachers import MultiLevelHierarchicalTeacher
@@ -251,9 +247,6 @@ class ProbeLogger:
         train_frac = self.cfg.probe_train_frac
 
         metrics: Dict[str, float] = {}
-        heat_acc: Dict[Tuple[int, int], np.ndarray] = {}
-        heat_excess: Dict[Tuple[int, int], np.ndarray] = {}
-
         for layer_idx, R in residuals.items():
             for level in range(self.num_levels):
                 labels = labels_per_level[level]
@@ -291,10 +284,6 @@ class ProbeLogger:
                         metrics[f"{stub}/acc/{split}"] = acc
                         metrics[f"{stub}/nll/{split}"] = nll
                         metrics[f"{stub}/n/{split}"] = X_eval.shape[0]
-                        heat_acc.setdefault((level, offset), self._nan_mat(level))[
-                            layer_idx, slot
-                        ] = acc
-
                         bayes = self._bayes_ceiling(
                             offset, belief, bvalid, eval_slice, logits, y_eval
                         )
@@ -303,29 +292,6 @@ class ProbeLogger:
                             metrics[f"{stub}/bayes_acc/{split}"] = bayes_acc
                             metrics[f"{stub}/bayes_nll/{split}"] = bayes_nll
                             metrics[f"{stub}/excess_nll/{split}"] = excess
-                            heat_excess.setdefault(
-                                (level, offset), self._nan_mat(level)
-                            )[layer_idx, slot] = excess
-
-        for (level, offset), mat in heat_acc.items():
-            if np.isnan(mat).all():
-                continue
-            fig = _grid_heatmap(
-                mat, f"probe acc — level{level}, {split}, k={offset:+d}", 0.0, 1.0, "viridis"
-            )
-            key = f"probe/summary/level{level}/{_offset_name(offset)}/acc_heatmap/{split}"
-            metrics[key] = wandb.Image(fig)
-            plt.close(fig)
-        for (level, offset), mat in heat_excess.items():
-            if np.isnan(mat).all():
-                continue
-            vmax = max(float(np.nanmax(mat)), 1e-6)
-            fig = _grid_heatmap(
-                mat, f"excess nll — level{level}, {split}, k={offset:+d}", 0.0, vmax, "magma"
-            )
-            key = f"probe/summary/level{level}/{_offset_name(offset)}/excess_heatmap/{split}"
-            metrics[key] = wandb.Image(fig)
-            plt.close(fig)
 
         self.writer.log(metrics, step=step)
         self._clear_val_buffers()
@@ -444,9 +410,6 @@ class ProbeLogger:
             return bayes_acc, bayes_nll, probe_nll - bayes_nll
         return None
 
-    def _nan_mat(self, level: int) -> np.ndarray:
-        return np.full((self.num_layers, self.level_arity[level]), np.nan)
-
     def _lbfgs_fit(self, probe: nn.Linear, X: torch.Tensor, y: torch.Tensor) -> None:
         opt = torch.optim.LBFGS(
             probe.parameters(),
@@ -479,31 +442,6 @@ def _residuals_by_layer(
     for layer_idx, tensor in captures:
         out[layer_idx] = tensor
     return out
-
-
-def _grid_heatmap(
-    mat: np.ndarray, title: str, vmin: float, vmax: float, cmap: str
-) -> plt.Figure:
-    """Layer × slot heatmap of an arbitrary per-cell value."""
-    n_layers, n_slots = mat.shape
-    fig, ax = plt.subplots(figsize=(1.5 + 0.6 * n_slots, 1.0 + 0.5 * n_layers))
-    sns.heatmap(
-        mat,
-        vmin=vmin,
-        vmax=vmax,
-        cmap=cmap,
-        annot=True,
-        fmt=".2f",
-        xticklabels=[f"s{s}" for s in range(n_slots)],
-        yticklabels=[f"L{l}" for l in range(n_layers)],
-        cbar=True,
-        ax=ax,
-    )
-    ax.set_title(title)
-    ax.set_xlabel("within-unit slot")
-    ax.set_ylabel("layer")
-    fig.tight_layout()
-    return fig
 
 
 def _offset_name(offset: int) -> str:

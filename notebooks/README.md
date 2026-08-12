@@ -8,6 +8,7 @@ the fact — nothing in this folder is imported by training.
 | Path | Role |
 | --- | --- |
 | `head_phases.ipynb` | **The analysis notebook.** Fetch runs by tag, detect stage-wise head specialization, plot the trajectories. |
+| `post_training_visualizations.ipynb` | Recreate attention, alignment, value, and probe images from numerical W&B logs. |
 | `report_head_phases.py` | Same read-out as a one-shot CLI, for when you don't want a notebook. |
 | `utils.py` | W&B fetching (`fetch_runs`, `get_runs_data`) and shared plot styling. |
 | `figures/` | Saved plots. Gitignored — regenerate from the notebook. |
@@ -38,10 +39,22 @@ Training writes to the project in `conf/misc/default.yaml`:
 entity: okyksl      project: hmm-attention
 ```
 
-`utils.py`'s `DEFAULT_ENTITY` / `DEFAULT_PROJECT` are inherited from the previous
-repo and point somewhere else. Pointing at the wrong project returns an **empty
-frame with no error**, so pass `entity=` / `project=` explicitly (the notebook and
-CLI already do).
+`utils.py`'s `DEFAULT_ENTITY` / `DEFAULT_PROJECT` match these settings. Pointing
+at the wrong project returns an **empty frame with no error**, so override them
+explicitly when analyzing runs from another W&B project.
+
+## Post-training images
+
+Training keeps the requested attention/probe cadence but logs numerical data
+only. The attention tables under `attn/L{layer}/weights/{split}` contain
+batch-averaged attention **activations**, not learned parameter weights. Probe
+layer×slot grids are represented by their per-cell scalar series. This avoids
+Matplotlib rendering, PNG encoding, and image uploads in the training loop.
+
+Open `post_training_visualizations.ipynb`, enter a run ID and exact logged steps,
+then render any of the former images locally. Numerical attention tables are
+cached under `notebooks/.cache/`; optional PNG/PDF output belongs under
+`notebooks/figures/`. Both directories are gitignored.
 
 ## What the analysis answers
 

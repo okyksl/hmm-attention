@@ -1,4 +1,8 @@
-"""Utility helpers for logging transformer self-attention during training.
+"""Numerical and rendering helpers for transformer self-attention.
+
+Training uses the numerical helpers to log averaged attention activations and
+derived scalars.  The rendering wrappers remain available for legacy callers
+and post-training analysis, but are intentionally absent from the hot path.
 
 Provides two independent representations:
 * `log_attention_table` – structured numeric weights in a wandb.Table for analysis
@@ -14,13 +18,35 @@ Provides two independent representations:
 Use `log_attention` as a wrapper when you want either or both attention functions.
 """
 
-from typing import List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
 import torch
 import torch.nn as nn
 import wandb
+
+
+@dataclass(frozen=True)
+class AttentionAlignment:
+    """Numerical alignment of student attention rows with teacher spans."""
+
+    last_rows: np.ndarray
+    ground_truth: np.ndarray
+    student_norms: np.ndarray
+    cosine_similarity: np.ndarray
+    projected_norm: np.ndarray
+
+
+@dataclass(frozen=True)
+class ValueAlignment:
+    """Numerical alignment of per-head value matrices with teacher matrices."""
+
+    student_norms: np.ndarray
+    cosine_similarity: np.ndarray
+    projected_norm: np.ndarray
+    inner_product: np.ndarray
 
 
 def _get_attention(
@@ -244,6 +270,77 @@ def compute_gt_attention_row(
     return gt
 
 
+def compute_attention_alignment(
+    attn_avg: np.ndarray,
+    span_lengths: List[int],
+    context_length: int,
+    stride: Optional[int] = None,
+) -> AttentionAlignment:
+    """Compute attention/span alignment without rendering or logging."""
+    num_heads, seq_len, _ = attn_avg.shape
+    ground_truth = compute_gt_attention_row(
+        span_lengths, context_length, seq_len, stride=stride
+    )
+    last_rows = attn_avg[:, -1, :]
+    student_norms = np.linalg.norm(last_rows, axis=1)
+    gt_norms = np.linalg.norm(ground_truth, axis=1)
+
+    dots = last_rows @ ground_truth.T
+    denom = student_norms[:, None] * gt_norms[None, :]
+    cosine = np.divide(
+        dots,
+        denom,
+        out=np.zeros((num_heads, len(span_lengths)), dtype=np.float32),
+        where=denom != 0,
+    ).astype(np.float32, copy=False)
+    projected = (student_norms[:, None] * cosine).astype(np.float32, copy=False)
+    return AttentionAlignment(
+        last_rows=last_rows,
+        ground_truth=ground_truth,
+        student_norms=student_norms,
+        cosine_similarity=cosine,
+        projected_norm=projected,
+    )
+
+
+def attention_alignment_scalars(
+    alignment: AttentionAlignment,
+    split: str,
+    layer_name: str,
+) -> Dict[str, float]:
+    """Return the existing W&B attention-alignment scalar series."""
+    metrics: Dict[str, float] = {}
+    for h, norm in enumerate(alignment.student_norms):
+        metrics[f"attn/{layer_name}/align_norm_head{h + 1}/{split}"] = float(norm)
+    for h in range(alignment.cosine_similarity.shape[0]):
+        for k in range(alignment.cosine_similarity.shape[1]):
+            metrics[
+                f"attn/{layer_name}/align_cos_sim_head{h + 1}_span{k + 1}/{split}"
+            ] = float(alignment.cosine_similarity[h, k])
+    return metrics
+
+
+def attention_span_mass_scalars(
+    attn_avg: np.ndarray,
+    span_lengths: List[int],
+    context_length: int,
+    split: str,
+    stride: Optional[int] = None,
+    layer_name: str = "L1",
+) -> Dict[str, float]:
+    """Return per-(head, span) last-query attention mass scalars."""
+    num_heads, seq_len, _ = attn_avg.shape
+    last_rows = attn_avg[:, -1, :]
+    ranges = _span_column_ranges(span_lengths, context_length, seq_len, stride)
+    metrics: Dict[str, float] = {}
+    for k, (start, end) in enumerate(ranges):
+        for h in range(num_heads):
+            metrics[
+                f"attn/{layer_name}/span_mass_head{h + 1}_span{k + 1}/{split}"
+            ] = float(last_rows[h, start:end].sum())
+    return metrics
+
+
 def _heatmap_image(
     matrix: np.ndarray,
     row_labels: List[str],
@@ -276,6 +373,77 @@ def _heatmap_image(
     img = wandb.Image(fig)
     plt.close(fig)
     return img
+
+
+def compute_value_alignment(
+    teacher_matrices: torch.Tensor,
+    student: torch.nn.Module,
+    dim: int,
+    layer: int = 0,
+) -> Optional[ValueAlignment]:
+    """Compute value/teacher alignment without rendering or logging.
+
+    Returns ``None`` for the shared-value-projection architecture, matching the
+    historical no-op behavior of the value-alignment loggers.
+    """
+    block = student.transformer_blocks[layer]
+    mha = block.self_attention
+    if not getattr(mha, "attention_disentanglement", False):
+        return None
+    if not isinstance(mha.value_proj, nn.ModuleList):
+        return None
+
+    teacher_np = teacher_matrices.detach().cpu().numpy()
+    teacher_flat = teacher_np.reshape(teacher_np.shape[0], -1)
+    teacher_norms = np.linalg.norm(teacher_flat, axis=1)
+    num_heads = len(mha.value_proj)
+
+    student_flat = np.zeros((num_heads, dim * dim), dtype=teacher_np.dtype)
+    valid_heads = np.zeros(num_heads, dtype=bool)
+    for h, projection in enumerate(mha.value_proj):
+        if not isinstance(projection, nn.Linear):
+            continue
+        student_flat[h] = (
+            projection.weight.detach().cpu().numpy()[:dim, :dim].reshape(-1)
+        )
+        valid_heads[h] = True
+
+    student_norms = np.linalg.norm(student_flat, axis=1)
+    inner = student_flat @ teacher_flat.T
+    denom = student_norms[:, None] * teacher_norms[None, :]
+    cosine = np.divide(
+        inner,
+        denom,
+        out=np.zeros_like(inner, dtype=np.float32),
+        where=(denom != 0) & valid_heads[:, None],
+    ).astype(np.float32, copy=False)
+    projected = (student_norms[:, None] * cosine).astype(np.float32, copy=False)
+    return ValueAlignment(
+        student_norms=student_norms,
+        cosine_similarity=cosine,
+        projected_norm=projected,
+        inner_product=inner,
+    )
+
+
+def value_alignment_scalars(
+    alignment: ValueAlignment,
+    split: str,
+    layer_name: str,
+) -> Dict[str, float]:
+    """Return every numerical value-alignment series needed post-training."""
+    metrics: Dict[str, float] = {}
+    for h, norm in enumerate(alignment.student_norms):
+        metrics[f"attn/{layer_name}/value_norm_head{h + 1}/{split}"] = float(norm)
+    for h in range(alignment.cosine_similarity.shape[0]):
+        for k in range(alignment.cosine_similarity.shape[1]):
+            metrics[
+                f"attn/{layer_name}/value_cos_head{h + 1}_teacher{k + 1}/{split}"
+            ] = float(alignment.cosine_similarity[h, k])
+            metrics[
+                f"attn/{layer_name}/value_inner_head{h + 1}_teacher{k + 1}/{split}"
+            ] = float(alignment.inner_product[h, k])
+    return metrics
 
 
 def log_value_matrix_alignment(

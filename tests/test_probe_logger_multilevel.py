@@ -161,3 +161,6 @@ def test_end_to_end_log_emits_per_level_metrics():
     # Accuracies are valid probabilities.
     accs = [v for k, v in writer.logged.items() if k.endswith("/acc/val")]
     assert accs and all(0.0 <= v <= 1.0 for v in accs)
+    # Summary heatmaps are rebuilt from these scalars after training.
+    assert not any("heatmap" in key for key in keys)
+    assert all(isinstance(value, (int, float)) for value in writer.logged.values())

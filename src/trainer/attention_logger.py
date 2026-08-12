@@ -1,26 +1,27 @@
 from typing import List, Optional
 
+import numpy as np
 import torch
 
 from src.model import TransformerDecoder
+from src.profiling import get_profiler
 from src.teachers import LinearARTeacher
 from src.visualizer import (
-    log_attention_alignment,
-    log_attention_heatmap,
-    log_attention_span_mass,
-    log_attention_table,
-    log_value_alignment_scalars,
-    log_value_matrix_alignment,
+    attention_alignment_scalars,
+    attention_span_mass_scalars,
+    build_attention_table,
+    compute_attention_alignment,
+    compute_value_alignment,
+    value_alignment_scalars,
 )
 
 
 class AttentionLogger:
-    """Owns all attention visualization for train/val loops.
+    """Log numerical attention snapshots and derived scalars.
 
-    No-ops unless `student` is a `TransformerDecoder`, `writer` is not None,
-    and `step % frequency == 0`. Alignment-based logs (attention pattern,
-    value-matrix alignment) additionally require a `LinearARTeacher` since
-    they read `teacher._params` and `span_lengths`.
+    The tables contain batch-averaged attention activations, not learned model
+    parameters.  Rendering is deliberately deferred to post-training analysis
+    so the requested numerical cadence does not stall the training loop.
     """
 
     def __init__(
@@ -35,6 +36,35 @@ class AttentionLogger:
         self.student = student
         self.frequency = frequency
 
+    @staticmethod
+    def _average_batches(attn_weight_batches: List[torch.Tensor]) -> np.ndarray:
+        """Weighted batch mean as ``(layer, head, query, key)`` on CPU.
+
+        Reduction happens on the source device and only the small mean is
+        transferred.  Accumulating sums avoids concatenating validation batches
+        and remains correct when the final batch is smaller.
+        """
+        expected_shape = attn_weight_batches[0].shape
+        if len(expected_shape) != 5:
+            raise ValueError(
+                "attention batches must have shape "
+                "(layer, batch, head, query, key)"
+            )
+
+        total: Optional[torch.Tensor] = None
+        count = 0
+        reference = expected_shape[:1] + expected_shape[2:]
+        for batch in attn_weight_batches:
+            if len(batch.shape) != 5 or batch.shape[:1] + batch.shape[2:] != reference:
+                raise ValueError("attention batch shapes differ outside the batch axis")
+            batch_sum = batch.detach().sum(dim=1, dtype=torch.float32)
+            total = batch_sum if total is None else total + batch_sum
+            count += batch.shape[1]
+
+        if total is None or count == 0:
+            raise ValueError("cannot average empty attention batches")
+        return (total / count).cpu().numpy()
+
     def log(
         self,
         step: int,
@@ -48,79 +78,61 @@ class AttentionLogger:
         if not attn_weight_batches:
             return
 
-        # (layer, batch, head, seq_len, seq_len); concat along batch.
-        attn_weights = torch.cat(attn_weight_batches, dim=1)
-        n_layers = attn_weights.shape[0]
+        with get_profiler().cpu(f"attention_log_{split}"):
+            attn_avg = self._average_batches(attn_weight_batches)
+            payload = {}
 
-        for layer in range(n_layers):
-            # Always include `/L{layer}` — even for single-block runs — so
-            # wandb groups per-layer visualizations into a dedicated tab. This
-            # also keeps key structure stable when you flip `num_blocks` in an
-            # experiment. Dashboard layer numbers are one-based.
-            layer_name = f"L{layer + 1}"
+            for layer, layer_attn in enumerate(attn_avg):
+                # Keep the historical W&B key.  Here "weights" means attention
+                # activations; it does not refer to learned parameters.
+                layer_name = f"L{layer + 1}"
+                payload[f"attn/{layer_name}/weights/{split}"] = (
+                    build_attention_table(layer_attn)
+                )
 
-            # Batch-averaged per-layer attention: (heads, seq_len, seq_len)
-            attn_avg = (
-                attn_weights[layer].detach().cpu().numpy().mean(axis=0)
-            )
+                if not isinstance(self.teacher, LinearARTeacher):
+                    continue
 
-            log_attention_table(
-                run=self.writer,
-                attn_weights=attn_weights,
-                layer=layer,
-                batch_idx=-1,
-                step=step,
-                table_key=f"attn/{layer_name}/weights/{split}",
-            )
-            log_attention_heatmap(
-                run=self.writer,
-                attn_weights=attn_avg,
-                log_key=f"attn/{layer_name}/heatmaps/{split}",
-                step=step,
-            )
-
-            if isinstance(self.teacher, LinearARTeacher):
                 stride: Optional[int] = getattr(self.teacher, "stride", None)
-                ctx_len = getattr(
-                    self.teacher, "context_length", sum(self.teacher.span_lengths)
+                context_length = getattr(
+                    self.teacher,
+                    "context_length",
+                    sum(self.teacher.span_lengths),
                 )
-                log_attention_alignment(
-                    run=self.writer,
-                    attn_avg=attn_avg,
+                alignment = compute_attention_alignment(
+                    layer_attn,
                     span_lengths=self.teacher.span_lengths,
-                    context_length=ctx_len,
-                    step=step,
-                    split=split,
-                    layer_name=layer_name,
+                    context_length=context_length,
                     stride=stride,
                 )
-                log_attention_span_mass(
-                    run=self.writer,
-                    attn_avg=attn_avg,
-                    span_lengths=self.teacher.span_lengths,
-                    context_length=ctx_len,
-                    step=step,
-                    split=split,
-                    layer_name=layer_name,
-                    stride=stride,
+                payload.update(
+                    attention_alignment_scalars(alignment, split, layer_name)
                 )
-                log_value_matrix_alignment(
-                    run=self.writer,
+                payload.update(
+                    attention_span_mass_scalars(
+                        layer_attn,
+                        span_lengths=self.teacher.span_lengths,
+                        context_length=context_length,
+                        split=split,
+                        layer_name=layer_name,
+                        stride=stride,
+                    )
+                )
+
+                value_alignment = compute_value_alignment(
                     teacher_matrices=self.teacher._params,
                     student=self.student,
                     dim=self.teacher.dim,
-                    step=step,
-                    split=split,
-                    layer_name=layer_name,
                     layer=layer,
                 )
-                log_value_alignment_scalars(
-                    run=self.writer,
-                    teacher_matrices=self.teacher._params,
-                    student=self.student,
-                    dim=self.teacher.dim,
-                    step=step,
-                    split=split,
-                    layer_name=layer_name,
-                    layer=layer,
-                )
+                if value_alignment is not None:
+                    payload.update(
+                        value_alignment_scalars(
+                            value_alignment,
+                            split=split,
+                            layer_name=layer_name,
+                        )
+                    )
+
+            # One history row / queue operation per split and attention step.
+            self.writer.log(payload, step=step)
