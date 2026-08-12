@@ -1,30 +1,46 @@
-# Incremental Learning of Sparse Attention Patterns in Transformers
+# hmm-attention
 
-This is the official code for the paper on [Incremental Learning of Sparse Attention Patterns in Transformers](https://arxiv.org/pdf/2602.19143) presented at [EurIPS 2025 Workshop
-on Principles of Generative Modeling](https://okyksl.github.io/slides/prigm-2025/#/1) and accepted to ICML 2026 Main Conference.
+A research repository for studying **how a transformer discovers the abstract
+compositional units of a hierarchical grammar**. A fixed "teacher" process
+generates sequences from a stratified PCFG (equivalently, a hierarchical HMM); a
+transformer "student" is trained to imitate it; probes then measure *where and
+when* the student represents each latent level.
 
-The `analysis/` folder contains notebooks for regenerating the paper plots from
-the W&B project `r-alvarezlucendo16/incremental-learning`.
+## Setting
 
-## Installation
+- **Teacher.** An autoregressive base process over a hidden alphabet, wrapped in
+    one or more chunk levels. Each level maps a token to fixed-length surface
+    tuples via a codebook with globally disjoint supports, so surface→latent
+    decoding is exact. `num_tuples > 1` gives each unit several interchangeable
+    spellings — the knob that forces *abstraction* over surface memorization.
+    Next-token probabilities are computed by an exact Bayes fold over the nested
+    open chunks, so every latent has a known optimal posterior.
+- **Student.** A decoder-only transformer trained to match the teacher's
+    next-token distribution.
+- **Instruments.** Linear probes on the residual stream decode each level's
+    latent, compared against the teacher's Bayes-optimal ceiling; a post-training
+    tool tests whether a probe generalizes across a unit's spellings.
+
+## Layout
+
+- `src/teachers/` — base processes (`LinearARTeacher`, `AttentionARTeacher`) and
+    the chunk stack (`ChunkCode`, `MultiLevelHierarchicalTeacher`, and its `L=1`
+    `HierarchicalTeacher`).
+- `src/predictors/`, `src/data.py` — turn a teacher into a sampler and generate
+    the AR dataset.
+- `src/model/` — the transformer student.
+- `src/trainer/` — training loop, evaluation, and the residual `ProbeLogger`.
+- `src/analysis/` — post-training analyses (e.g. spelling generalization).
+- `src/runner/`, `conf/` — Hydra config and entry glue.
+- `tests/` — correctness suite for teachers, probes, and analyses.
+
+## Usage
+
+Run from the `torch` conda env or with `uv`:
 
 ```bash
-uv sync
-```
+uv run python train.py experiments=multilevel_dissection
+uv run python -m pytest
 
-## Running Experiments
-
-```bash
-# List available experiments
-bash run.sh
-
-# Run a specific experiment
-bash run.sh <experiment_name>
-```
-
-## Configuration
-
-Experiments are configured using [Hydra](https://hydra.cc/) with configs located in `conf/`.
-
-- **Experiment configs** in `conf/experiments/` override base settings from `conf/train.yaml`
-- **Component configs** can be customized: `model/`, `dataset/`, `optimizer/`, `scheduler/`, `loss/`
+Teachers, chunk levels, base process, and probes are all configured under
+conf/ (see conf/experiments/ for worked examples).
