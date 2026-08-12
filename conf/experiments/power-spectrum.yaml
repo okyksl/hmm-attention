@@ -1,0 +1,35 @@
+# @package _global_
+# Base for the power-law spectrum ablations. Pins both laws to `power` and puts
+# the outer peak on the most recent span, so sweeps only need to vary the two
+# exponents:
+#
+#   teacher.spectrum.alpha      (alpha_in)  - how fast FEATURE importance decays
+#   teacher.lag_spectrum.alpha  (alpha_out) - how fast POSITION importance decays
+#
+# Global importance of (position i, feature k) is  i^-alpha_out * k^-alpha_in.
+# Whether the two rankings *interleave* is set entirely by their ratio:
+#
+#   alpha_out <  alpha_in  ->  pos#2/feat#1 beats pos#1/feat#2   (interleaved)
+#   alpha_out >  alpha_in  ->  a position's whole spectrum outranks the next
+#
+# NOTE: setting `alpha` without `law: power` is a silent no-op — the default
+# `lag_spectrum.law` is geometric, which reads `decay`, not `alpha`. That is
+# why the laws live here rather than on the command line.
+
+teacher:
+  span_lengths: [1, 1, 1]   # one token per lag: span k == offset -(W-k)
+  spectrum:
+    law: power
+    alpha: 1.0
+    rank: 16
+    normalize: spectral     # inner is shape-only; the outer law sets the norm
+  lag_spectrum:
+    law: power
+    alpha: 0.5
+    normalize: none         # absolute, so w_i IS lag i's matrix norm
+    reverse: true           # peak on the most recent span
+
+misc:
+  log_attention_frequency: 25   # the analysis resolution for acquisition steps
+  wandb:
+    tags: ["power-spectrum"]

@@ -15,7 +15,14 @@ import sys
 import numpy as np
 import pandas as pd
 
-from src.analysis.head_phases import COS_SIM, SPAN_MASS, metric_key, metric_keys, phase_table
+from src.analysis.head_phases import (
+    COS_SIM,
+    FOCUS_STRATEGIES,
+    SPAN_MASS,
+    metric_key,
+    metric_keys,
+    phase_table,
+)
 
 # Training writes to conf/misc/default.yaml's wandb target, which is NOT the
 # default baked into notebooks/utils.py — pointing at the wrong project returns
@@ -66,7 +73,25 @@ def main(argv=None) -> int:
         choices=[SPAN_MASS, COS_SIM],
         help="span_mass is raw attention mass; align_cos_sim is scale-free",
     )
-    p.add_argument("--threshold", type=float, default=0.5)
+    p.add_argument(
+        "--cutoff",
+        type=float,
+        default=0.5,
+        help="how much a span must dominate before a head counts as focused on it",
+    )
+    p.add_argument(
+        "--strategy",
+        default="share",
+        choices=list(FOCUS_STRATEGIES),
+        help="how --cutoff is applied: share of the head's mass, absolute value, "
+        "margin over the runner-up, or ratio to it",
+    )
+    p.add_argument(
+        "--min-dwell",
+        type=int,
+        default=2,
+        help="samples a label must persist before it counts as a phase",
+    )
     p.add_argument("--demo", action="store_true", help="use a synthetic frame")
     args = p.parse_args(argv)
 
@@ -103,7 +128,9 @@ def main(argv=None) -> int:
         layer=args.layer,
         split=args.split,
         metric=args.metric,
-        threshold=args.threshold,
+        cutoff=args.cutoff,
+        strategy=args.strategy,
+        min_dwell=args.min_dwell,
     )
 
     with pd.option_context("display.width", 200, "display.max_columns", 50):

@@ -9,13 +9,18 @@ import pandas as pd
 import pytest
 
 from src.analysis.head_phases import (
+    DIFFUSE,
     acquisition_step,
     analyze_run,
-    assign_heads,
+    head_trajectories,
+    FOCUS_STRATEGIES,
+    label_focused_span,
     metric_key,
     metric_keys,
     phase_table,
     predicted_span_order,
+    segment_labels,
+    span_coverage,
     span_offsets,
 )
 
@@ -44,29 +49,6 @@ def test_span_offsets_multi_token_spans_are_ranges():
 def test_span_offsets_with_stride():
     # context = (3-1)*1 + 2 = 4; spans start at 0, 1, 2.
     assert span_offsets([2, 2, 2], stride=1) == ["-4..-3", "-3..-2", "-2..-1"]
-
-
-# ---- assignment --------------------------------------------------------------
-
-
-def test_assign_heads_recovers_the_permutation():
-    final = np.array([[0.1, 0.9, 0.2], [0.8, 0.1, 0.1], [0.1, 0.2, 0.7]])
-    assert assign_heads(final) == [1, 0, 2]
-
-
-def test_assign_heads_is_one_to_one_under_a_shared_favourite():
-    # Every head likes span 0 best, but only one can own it; the assignment must
-    # still cover all three spans.
-    final = np.array([[0.9, 0.5, 0.1], [0.8, 0.1, 0.4], [0.7, 0.2, 0.2]])
-    assignment = assign_heads(final)
-    assert sorted(assignment) == [0, 1, 2]
-
-
-def test_assign_heads_leaves_extra_heads_unassigned():
-    final = np.array([[0.9, 0.1], [0.1, 0.9], [0.3, 0.3]])
-    assignment = assign_heads(final)
-    assert assignment[0] == 0 and assignment[1] == 1
-    assert assignment[2] == -1
 
 
 # ---- acquisition timing ------------------------------------------------------
@@ -124,14 +106,14 @@ def _synthetic_run(
 
 
 def test_analyze_run_recovers_assignment_and_order():
-    # Span 1 (offset -2) is learned first, then span 0 (-3), then span 2 (-1).
+    # Span 1 (offset -2) is covered first, then span 0 (-3), then span 2 (-1).
     df = _synthetic_run(onsets=(200, 50, 800))
     phases = analyze_run(df, num_heads=3, num_spans=3, span_lengths=[1, 1, 1])
 
     assert phases.assignment == [0, 1, 2]
     assert phases.acquired == {0: 200.0, 1: 50.0, 2: 800.0}
     assert phases.observed_order == [1, 0, 2]
-    assert phases.summary == "H2:-2@50 -> H1:-3@200 -> H3:-1@800"
+    assert phases.summary == "-2@50 -> -3@200 -> -1@800"
 
 
 def test_analyze_run_sorts_never_learned_spans_last():
@@ -140,7 +122,7 @@ def test_analyze_run_sorts_never_learned_spans_last():
     phases = analyze_run(df, num_heads=3, num_spans=3, span_lengths=[1, 1, 1])
     assert phases.observed_order[-1] == 2
     assert phases.acquired[2] is None
-    assert phases.summary.endswith("H3:-1@never")
+    assert phases.summary.endswith("-1@never")
 
 
 def test_analyze_run_drops_rows_without_attention_logs():
@@ -222,12 +204,132 @@ def test_phase_table_flags_agreement_with_the_configs_importance_order():
     assert by_run.loc["b", "order_rank_corr"] == pytest.approx(-1.0)
 
 
+def test_label_focused_span_share_strategy_needs_a_dominant_span():
+    # head 0 is focused on span 2; head 1 is spread evenly -> DIFFUSE.
+    values = np.array([[[0.05, 0.05, 0.90], [0.33, 0.33, 0.34]]])
+    labels = label_focused_span(values, cutoff=0.5, strategy="share")
+    assert labels.tolist() == [[2, DIFFUSE]]
+
+
+def test_label_focused_span_allows_several_heads_on_one_span():
+    # All three heads pile onto span 0 — the early collaborative regime. No
+    # matching, no exclusivity: every head is credited with span 0.
+    values = np.array([[[0.9, 0.05, 0.05]] * 3])
+    labels = label_focused_span(values, cutoff=0.5, strategy="share")
+    assert labels.tolist() == [[0, 0, 0]]
+
+
+def test_label_focused_span_absolute_strategy_uses_raw_value():
+    values = np.array([[[0.4, 0.9, 0.1]]])
+    assert label_focused_span(values, cutoff=0.8, strategy="absolute").tolist() == [[1]]
+    assert label_focused_span(values, cutoff=0.95, strategy="absolute").tolist() == [[DIFFUSE]]
+
+
+def test_label_focused_span_margin_strategy_uses_gap_to_runner_up():
+    values = np.array([[[0.5, 0.9, 0.1]]])  # gap = 0.4
+    assert label_focused_span(values, cutoff=0.3, strategy="margin").tolist() == [[1]]
+    assert label_focused_span(values, cutoff=0.5, strategy="margin").tolist() == [[DIFFUSE]]
+
+
+def test_label_focused_span_ratio_strategy_is_scale_free():
+    values = np.array([[[0.2, 0.8, 0.1]]])  # ratio = 4x
+    assert label_focused_span(values, cutoff=3.0, strategy="ratio").tolist() == [[1]]
+    assert label_focused_span(values, cutoff=5.0, strategy="ratio").tolist() == [[DIFFUSE]]
+    # Scaling every entry leaves the verdict unchanged.
+    assert label_focused_span(values * 100, cutoff=3.0, strategy="ratio").tolist() == [[1]]
+
+
+def test_label_focused_span_rejects_unknown_strategy():
+    with pytest.raises(ValueError, match="strategy must be one of"):
+        label_focused_span(np.zeros((1, 1, 3)), strategy="bogus")
+
+
+def test_label_focused_span_handles_negative_cosine_similarities():
+    # cos-sim can go negative; share must not be corrupted by a negative total.
+    values = np.array([[[-0.3, 0.9, -0.2]]])
+    assert label_focused_span(values, cutoff=0.5, strategy="share").tolist() == [[1]]
+
+
+# ---- trajectories ------------------------------------------------------------
+
+
+def _traj_values(paths, steps):
+    """paths[h] = list of (span, until_step); build a (T,H,K) focus tensor."""
+    T, H = len(steps), len(paths)
+    values = np.full((T, H, 3), 0.05)
+    for h, path in enumerate(paths):
+        for t, step in enumerate(steps):
+            span = next(sp for sp, until in path if step < until)
+            values[t, h, span] = 0.9
+    return values
+
+
+def test_head_trajectories_capture_migration():
+    # Head 0 starts on the dominant span 2, then breaks away to span 0.
+    steps = np.arange(0, 1000, 50)
+    values = _traj_values([[(2, 600), (0, np.inf)]], steps)
+    (traj,) = head_trajectories(steps, values, cutoff=0.5, strategy="share")
+    assert [s.span for s in traj] == [2, 0]
+    assert traj[0].start_step == 0
+    assert traj[1].start_step == 600
+
+
+def test_head_trajectories_absorb_single_sample_flicker():
+    steps = np.arange(0, 500, 50)
+    values = np.full((len(steps), 1, 3), 0.05)
+    values[:, 0, 2] = 0.9
+    values[4, 0, 2] = 0.05          # one-sample dropout to span 0
+    values[4, 0, 0] = 0.9
+    (traj,) = head_trajectories(steps, values, min_dwell=2)
+    assert [s.span for s in traj] == [2]   # flicker absorbed, no phantom phase
+
+
+def test_span_coverage_credits_the_first_holder_not_the_last():
+    # Span 2 is held by head 0 early, then head 0 leaves and head 1 takes it.
+    steps = np.arange(0, 1000, 50)
+    values = _traj_values(
+        [[(2, 400), (0, np.inf)], [(1, 600), (2, np.inf)]], steps
+    )
+    trajectories = head_trajectories(steps, values)
+    coverage = span_coverage(trajectories, num_spans=3)
+    assert coverage[2] == 0      # credited to the first holder, not head 1 at 600
+    assert coverage[0] == 400
+    assert coverage[1] == 0
+
+
+def test_analyze_run_reports_migrations_and_sharing():
+    steps = np.arange(0, 1000, 50)
+    # Heads 0 and 1 both end on span 2; head 2 migrates 2 -> 0. Span 1 uncovered.
+    values = _traj_values(
+        [[(2, np.inf)], [(2, np.inf)], [(2, 500), (0, np.inf)]], steps
+    )
+    df = _frame_from_values(steps, values)
+    phases = analyze_run(df, num_heads=3, num_spans=3, span_lengths=[1, 1, 1])
+
+    assert phases.final_owners[2] == [0, 1]   # two heads share span 2
+    assert phases.final_owners[0] == [2]
+    assert phases.final_owners[1] == []       # nobody covers span 1
+    assert phases.shared_spans == 1
+    assert phases.uncovered_spans == 1
+    assert phases.migrations == 1
+    assert "2:" not in phases.head_path(2) or "-3" in phases.head_path(2)
+
+
+def _frame_from_values(steps, values):
+    T, H, K = values.shape
+    data = {"_step": steps, "_run_id": "r", "_run_name": "r"}
+    for h in range(H):
+        for k in range(K):
+            data[metric_key(h + 1, k + 1)] = values[:, h, k]
+    return pd.DataFrame(data)
+
+
 def test_phase_table_reports_per_head_spans_and_acquisition_columns():
     df = _cfg_columns(_synthetic_run(onsets=(200, 50, 800)), 1.0, 0.5)
     table = phase_table(df, num_heads=3, num_spans=3, span_lengths=[1, 1, 1])
     row = table.iloc[0]
-    assert row["head1_span"] == "-3"
-    assert row["head2_span"] == "-2"
+    assert row["head1_final"] == "-3"
+    assert row["head2_final"] == "-2"
     assert row["acq_-2"] == 50.0
     assert row["acq_-1"] == 800.0
     assert row["cfg.teacher.spectrum.alpha"] == 1.0

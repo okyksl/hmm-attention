@@ -9,13 +9,17 @@ That is enough to reconstruct the specialization story automatically:
 
 This module turns those scalar series into
 
-  * a one-to-one **head -> span assignment** (which head owns which position),
-  * an **acquisition step** per span (when that head locked on),
+  * a per-head **trajectory**: the sequence of spans each head attends to over
+    training, so a head that starts on the dominant position and later migrates
+    to its own is described as `-1@0 -> -3@600` rather than collapsed to its
+    endpoint. Migration is the phenomenon, not noise: early in training all
+    heads pile onto the most important span, then break away one at a time.
+  * a **coverage step** per span — when that span first acquired a stable owner,
   * the resulting **learning order**,
 
 and compares the observed order against the order **predicted by the config**:
 the teacher's outer `lag_spectrum` says how important each span is, and the
-hypothesis under test is that heads acquire spans in decreasing importance.
+hypothesis under test is that spans are covered in decreasing importance.
 
 Typical use:
 
@@ -30,7 +34,6 @@ Typical use:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from itertools import permutations
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -38,6 +41,12 @@ import pandas as pd
 
 SPAN_MASS = "span_mass"
 COS_SIM = "align_cos_sim"
+
+#: Label for a head that is not focused on any single span at a given step.
+DIFFUSE = -1
+
+#: How the per-step focus cutoff is applied. See `label_focused_span`.
+FOCUS_STRATEGIES = ("share", "absolute", "margin", "ratio")
 
 
 # --- metric keys --------------------------------------------------------------
@@ -121,35 +130,161 @@ def head_span_series(
     return steps, values
 
 
-def assign_heads(final: np.ndarray) -> List[int]:
-    """One-to-one head -> span assignment maximizing total affinity.
+@dataclass(frozen=True)
+class Segment:
+    """A stretch of training during which one head held one span (or nothing).
 
-    `final` is `(num_heads, num_spans)`. Returns a list where entry `h` is the
-    span index owned by head `h`, or `-1` if head `h` is left unassigned
-    (more heads than spans). Exact for small problems, greedy beyond that.
+    `span == DIFFUSE` means the head was not committed to any single span over
+    this stretch — the early collaborative regime, or a head that never
+    specializes at all.
     """
-    num_heads, num_spans = final.shape
-    n = min(num_heads, num_spans)
 
-    if num_heads <= 7 and num_spans <= 7:
-        best_score, best = -np.inf, None
-        for spans in permutations(range(num_spans), n):
-            for heads in permutations(range(num_heads), n):
-                score = sum(final[h, k] for h, k in zip(heads, spans))
-                if score > best_score:
-                    best_score, best = score, dict(zip(heads, spans))
-        return [best.get(h, -1) for h in range(num_heads)]
+    span: int
+    start_step: float
+    end_step: float
+    n_samples: int
 
-    # Greedy fallback: repeatedly take the largest remaining affinity.
-    order = np.dstack(np.unravel_index(np.argsort(-final, axis=None), final.shape))[0]
-    taken_h, taken_k, out = set(), set(), {}
-    for h, k in order:
-        if h in taken_h or k in taken_k:
-            continue
-        out[int(h)] = int(k)
-        taken_h.add(h)
-        taken_k.add(k)
-    return [out.get(h, -1) for h in range(num_heads)]
+
+def label_focused_span(
+    values: np.ndarray, cutoff: float = 0.5, strategy: str = "share"
+) -> np.ndarray:
+    """`(T, H, K)` affinities -> `(T, H)` span labels, `DIFFUSE` where unfocused.
+
+    Each head is judged **independently**: several heads may focus on the same
+    span (the early collaborative regime, or genuine redundancy), and a span may
+    end up with no head at all. There is no matching and no exclusivity.
+
+    A head is credited with its strongest span only if that span clears
+    `cutoff` under `strategy`:
+
+    * ``share``    — the span's fraction of the head's total affinity across
+      spans. Scale-free and independent of sequence length. Uniform attention
+      gives every span `1/K`, so any `cutoff > 1/K` reads as unfocused.
+      Good default for ``span_mass``.
+    * ``absolute`` — the raw value. Natural for ``align_cos_sim``, where
+      `cutoff=0.7` means "genuinely aligned with this span's shape".
+    * ``margin``   — how far the best span beats the runner-up, in raw units.
+      Use when what matters is *separation* rather than level.
+    * ``ratio``    — best / runner-up. Like ``margin`` but scale-free;
+      `cutoff=2.0` means "twice the next-best span".
+
+    Negative affinities (possible for cosine similarity) are clipped to zero for
+    the ``share`` and ``ratio`` denominators.
+    """
+    if strategy not in FOCUS_STRATEGIES:
+        raise ValueError(f"strategy must be one of {FOCUS_STRATEGIES}; got {strategy!r}")
+    if values.shape[-1] < 2 and strategy in ("margin", "ratio"):
+        raise ValueError(f"strategy {strategy!r} needs at least 2 spans to compare")
+
+    best = values.argmax(axis=-1)
+    best_val = np.take_along_axis(values, best[..., None], axis=-1)[..., 0]
+
+    if strategy == "absolute":
+        score = best_val
+    elif strategy == "share":
+        pos = np.clip(values, 0.0, None)
+        totals = pos.sum(axis=-1)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            score = np.where(totals > 0, np.clip(best_val, 0.0, None) / totals, 0.0)
+    else:  # margin / ratio, both against the runner-up
+        ordered = np.sort(values, axis=-1)
+        second = ordered[..., -2]
+        if strategy == "margin":
+            score = best_val - second
+        else:
+            second_pos = np.clip(second, 0.0, None)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                score = np.where(
+                    second_pos > 0,
+                    np.clip(best_val, 0.0, None) / second_pos,
+                    np.inf,  # runner-up at zero => unbounded dominance
+                )
+
+    score = np.nan_to_num(score, nan=0.0, posinf=np.inf)
+    return np.where(score >= cutoff, best, DIFFUSE).astype(int)
+
+
+def segment_labels(
+    steps: np.ndarray, labels: np.ndarray, min_dwell: int = 2
+) -> List[Segment]:
+    """Run-length encode one head's label series into `Segment`s.
+
+    Runs shorter than `min_dwell` samples are treated as flicker and absorbed
+    into the preceding surviving run (or the following one, at the start), so a
+    single noisy sample does not manufacture a phase transition.
+    """
+    if len(labels) == 0:
+        return []
+
+    # Raw run-length encoding.
+    runs: List[List[int]] = []  # [label, start_idx, end_idx_inclusive]
+    for i, lab in enumerate(labels):
+        if runs and runs[-1][0] == lab:
+            runs[-1][2] = i
+        else:
+            runs.append([int(lab), i, i])
+
+    # Absorb short runs, then re-merge neighbours that became equal.
+    if min_dwell > 1 and len(runs) > 1:
+        kept: List[List[int]] = []
+        for run in runs:
+            length = run[2] - run[1] + 1
+            if length < min_dwell and kept:
+                kept[-1][2] = run[2]  # extend the previous surviving run
+            elif length < min_dwell and not kept:
+                run_next = run  # leading flicker: hand its span to the next run
+                kept.append(run_next)
+            else:
+                kept.append(run)
+        merged: List[List[int]] = []
+        for run in kept:
+            if merged and merged[-1][0] == run[0]:
+                merged[-1][2] = run[2]
+            else:
+                merged.append(run)
+        runs = merged
+
+    return [
+        Segment(
+            span=lab,
+            start_step=float(steps[start]),
+            end_step=float(steps[end]),
+            n_samples=end - start + 1,
+        )
+        for lab, start, end in runs
+    ]
+
+
+def head_trajectories(
+    steps: np.ndarray,
+    values: np.ndarray,
+    cutoff: float = 0.5,
+    strategy: str = "share",
+    min_dwell: int = 2,
+) -> List[List[Segment]]:
+    """Per-head phase sequence over the whole run: `[head][segment]`."""
+    labels = label_focused_span(values, cutoff=cutoff, strategy=strategy)
+    return [segment_labels(steps, labels[:, h], min_dwell) for h in range(values.shape[1])]
+
+
+def span_coverage(
+    trajectories: Sequence[Sequence[Segment]], num_spans: int
+) -> Dict[int, Optional[float]]:
+    """First step at which each span acquired a stable owner (any head).
+
+    Unlike an endpoint-based reading, this credits the span at the moment it was
+    first held — even if the head that held it later moved on and a different
+    head inherited it.
+    """
+    first: Dict[int, Optional[float]] = {k: None for k in range(num_spans)}
+    for segments in trajectories:
+        for seg in segments:
+            if seg.span == DIFFUSE:
+                continue
+            current = first.get(seg.span)
+            if current is None or seg.start_step < current:
+                first[seg.span] = seg.start_step
+    return first
 
 
 def acquisition_step(
@@ -211,22 +346,74 @@ class RunPhases:
     num_heads: int
     num_spans: int
     span_labels: List[str]
-    assignment: List[int]  # head -> span index (-1 = unassigned)
-    acquired: Dict[int, Optional[float]]  # span index -> step
+    assignment: List[int]  # head -> span index at the FINAL step (-1 = diffuse)
+    acquired: Dict[int, Optional[float]]  # span index -> first stable coverage
     final_affinity: np.ndarray
+    trajectories: List[List[Segment]] = field(default_factory=list)
     observed_order: List[int] = field(default_factory=list)
     predicted_order: List[int] = field(default_factory=list)
 
+    def _label(self, span: int) -> str:
+        return "diffuse" if span == DIFFUSE else self.span_labels[span]
+
     @property
     def summary(self) -> str:
-        """e.g. `H2:-1@120 -> H1:-2@480 -> H3:-3@1500`."""
-        owner = {k: h for h, k in enumerate(self.assignment) if k >= 0}
+        """Span coverage order, e.g. `-1@120 -> -2@480 -> -3@1500`."""
         parts = []
         for k in self.observed_order:
             step = self.acquired.get(k)
             when = "never" if step is None else f"{step:g}"
-            parts.append(f"H{owner.get(k, -1) + 1}:{self.span_labels[k]}@{when}")
+            parts.append(f"{self.span_labels[k]}@{when}")
         return " -> ".join(parts)
+
+    def head_path(self, head: int) -> str:
+        """One head's migration path, e.g. `diffuse@0 > -1@150 > -3@600`."""
+        segs = self.trajectories[head] if head < len(self.trajectories) else []
+        return " > ".join(f"{self._label(s.span)}@{s.start_step:g}" for s in segs)
+
+    @property
+    def head_story(self) -> str:
+        """Every head's path, e.g. `H1:diffuse@0>-1@150 | H2:-1@0>-3@600`."""
+        return " | ".join(
+            f"H{h + 1}:{self.head_path(h)}" for h in range(len(self.trajectories))
+        )
+
+    @property
+    def final_owners(self) -> Dict[int, List[int]]:
+        """span -> heads focused on it at the end. May be empty, or several.
+
+        Heads are judged independently, so this is not a permutation: a span can
+        attract two heads (redundancy, or an unfinished break-away) while another
+        gets none.
+        """
+        owners: Dict[int, List[int]] = {k: [] for k in range(self.num_spans)}
+        for h, k in enumerate(self.assignment):
+            if k != DIFFUSE:
+                owners[k].append(h)
+        return owners
+
+    @property
+    def shared_spans(self) -> int:
+        """Spans held by more than one head at the end."""
+        return sum(1 for heads in self.final_owners.values() if len(heads) > 1)
+
+    @property
+    def uncovered_spans(self) -> int:
+        """Spans no head is focused on at the end."""
+        return sum(1 for heads in self.final_owners.values() if not heads)
+
+    @property
+    def migrations(self) -> int:
+        """How many times a head moved from one committed span to another.
+
+        Zero means every head picked a span and stayed; a positive count is the
+        collaborative-then-break-away dynamic actually happening.
+        """
+        total = 0
+        for segments in self.trajectories:
+            committed = [s.span for s in segments if s.span != DIFFUSE]
+            total += max(0, len(committed) - 1)
+        return total
 
     @property
     def order_matches_importance(self) -> Optional[bool]:
@@ -257,30 +444,42 @@ def analyze_run(
     layer: str = "L1",
     split: str = "train",
     metric: str = SPAN_MASS,
-    threshold: float = 0.5,
+    cutoff: float = 0.5,
+    strategy: str = "share",
+    min_dwell: int = 2,
     predicted_order: Optional[Sequence[int]] = None,
 ) -> RunPhases:
-    """Reconstruct the head-specialization story for one run's history frame."""
+    """Reconstruct the head-specialization story for one run's history frame.
+
+    The read-out is *trajectory-based*: each head is labelled at every logged
+    step with its strongest span if that span clears `cutoff` under `strategy`
+    (see `label_focused_span`), those labels are segmented into phases, and a
+    span counts as acquired the first time any head holds it stably. Heads are
+    judged independently, so several may share a span and some spans may go
+    uncovered. A head that starts on the dominant position and later migrates
+    keeps both phases in its path.
+    """
     steps, values = head_span_series(
         run_df, num_heads, num_spans, layer=layer, split=split, metric=metric
     )
     final = values[-1]
-    assignment = assign_heads(final)
+    trajectories = head_trajectories(
+        steps, values, cutoff=cutoff, strategy=strategy, min_dwell=min_dwell
+    )
 
-    acquired: Dict[int, Optional[float]] = {}
-    for h, k in enumerate(assignment):
-        if k < 0:
-            continue
-        acquired[k] = acquisition_step(steps, values[:, h, k], threshold=threshold)
+    # Final configuration: each head's label in its last segment.
+    assignment = [
+        segments[-1].span if segments else DIFFUSE for segments in trajectories
+    ]
+    acquired = span_coverage(trajectories, num_spans)
 
-    # Spans that never locked on sort last, in final-affinity order.
+    # Spans never covered sort last, strongest final affinity first among them.
     def sort_key(k: int) -> Tuple[int, float, float]:
         step = acquired.get(k)
-        owner = next((h for h, kk in enumerate(assignment) if kk == k), None)
-        strength = -float(final[owner, k]) if owner is not None else 0.0
+        strength = -float(final[:, k].max())
         return (1, 0.0, strength) if step is None else (0, step, strength)
 
-    observed_order = sorted(acquired.keys(), key=sort_key)
+    observed_order = sorted(range(num_spans), key=sort_key)
 
     labels = (
         span_offsets(span_lengths, stride)
@@ -297,6 +496,7 @@ def analyze_run(
         assignment=assignment,
         acquired=acquired,
         final_affinity=final,
+        trajectories=trajectories,
         observed_order=observed_order,
         predicted_order=list(predicted_order) if predicted_order is not None else [],
     )
@@ -333,14 +533,16 @@ def phase_table(
     layer: str = "L1",
     split: str = "train",
     metric: str = SPAN_MASS,
-    threshold: float = 0.5,
+    cutoff: float = 0.5,
+    strategy: str = "share",
+    min_dwell: int = 2,
     group_cols: Sequence[str] = (
         "cfg.teacher.spectrum.alpha",
         "cfg.teacher.lag_spectrum.alpha",
     ),
     use_config_prediction: bool = True,
 ) -> pd.DataFrame:
-    """One row per run: assignment, per-span acquisition step, and order match.
+    """One row per run: coverage order, per-head migration path, and order match.
 
     `df` is the frame returned by `notebooks.utils.get_runs_data`, which carries
     both history and flattened config columns.
@@ -364,7 +566,9 @@ def phase_table(
             layer=layer,
             split=split,
             metric=metric,
-            threshold=threshold,
+            cutoff=cutoff,
+            strategy=strategy,
+            min_dwell=min_dwell,
             predicted_order=predicted,
         )
 
@@ -377,9 +581,13 @@ def phase_table(
             if col in cfg:
                 row[col] = cfg[col]
         for h, k in enumerate(phases.assignment):
-            row[f"head{h + 1}_span"] = phases.span_labels[k] if k >= 0 else None
+            row[f"head{h + 1}_final"] = phases._label(k)
+            row[f"head{h + 1}_path"] = phases.head_path(h)
         for k in range(num_spans):
             row[f"acq_{phases.span_labels[k]}"] = phases.acquired.get(k)
+        row["migrations"] = phases.migrations
+        row["shared_spans"] = phases.shared_spans
+        row["uncovered_spans"] = phases.uncovered_spans
         row["observed_order"] = [phases.span_labels[k] for k in phases.observed_order]
         row["predicted_order"] = [phases.span_labels[k] for k in phases.predicted_order]
         row["order_matches"] = phases.order_matches_importance
