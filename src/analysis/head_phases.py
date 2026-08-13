@@ -41,6 +41,19 @@ import pandas as pd
 
 SPAN_MASS = "span_mass"
 COS_SIM = "align_cos_sim"
+VALUE_COS = "value_cos"
+VALUE_INNER = "value_inner"
+
+#: Second index noun per metric. Attention metrics are indexed by ground-truth
+#: *span*; value-matrix metrics by the *teacher* lag matrix they align with.
+#: Both are (head x lag), so the same trajectory machinery reads either — one
+#: says where a head looks, the other says which teacher matrix it implements.
+_METRIC_NOUN = {
+    SPAN_MASS: "span",
+    COS_SIM: "span",
+    VALUE_COS: "teacher",
+    VALUE_INNER: "teacher",
+}
 
 #: Label for a head that is not focused on any single span at a given step.
 DIFFUSE = -1
@@ -55,8 +68,9 @@ FOCUS_STRATEGIES = ("share", "absolute", "margin", "ratio")
 def metric_key(
     head: int, span: int, layer: str = "L1", split: str = "train", metric: str = SPAN_MASS
 ) -> str:
-    """The wandb key for one (head, span) series. `head`/`span` are 1-indexed."""
-    return f"attn/{layer}/{metric}_head{head}_span{span}/{split}"
+    """The wandb key for one (head, lag) series. `head`/`span` are 1-indexed."""
+    noun = _METRIC_NOUN.get(metric, "span")
+    return f"attn/{layer}/{metric}_head{head}_{noun}{span}/{split}"
 
 
 def metric_keys(
@@ -352,6 +366,9 @@ class RunPhases:
     trajectories: List[List[Segment]] = field(default_factory=list)
     observed_order: List[int] = field(default_factory=list)
     predicted_order: List[int] = field(default_factory=list)
+    #: Spans left out of the order comparison (e.g. supplied by a skip
+    #: connection). They still appear in `summary` and `acquired`.
+    excluded_spans: List[int] = field(default_factory=list)
 
     def _label(self, span: int) -> str:
         return "diffuse" if span == DIFFUSE else self.span_labels[span]
@@ -416,21 +433,34 @@ class RunPhases:
         return total
 
     @property
+    def comparable_order(self) -> List[int]:
+        """Observed coverage order with the excluded spans dropped.
+
+        `observed_order` keeps every span so the story stays complete; the
+        order metrics score only the spans attention was actually responsible
+        for.
+        """
+        excluded = set(self.excluded_spans)
+        return [k for k in self.observed_order if k not in excluded]
+
+    @property
     def order_matches_importance(self) -> Optional[bool]:
-        if not self.predicted_order or len(self.observed_order) != len(self.predicted_order):
+        observed = self.comparable_order
+        if not self.predicted_order or len(observed) != len(self.predicted_order):
             return None
-        return self.observed_order == self.predicted_order
+        return observed == self.predicted_order
 
     @property
     def order_rank_corr(self) -> Optional[float]:
         """Spearman correlation between predicted and observed acquisition order."""
-        if not self.predicted_order or len(self.observed_order) != len(self.predicted_order):
+        observed = self.comparable_order
+        if not self.predicted_order or len(observed) != len(self.predicted_order):
             return None
         n = len(self.predicted_order)
         if n < 2:
             return None
         pred_rank = {k: i for i, k in enumerate(self.predicted_order)}
-        obs_rank = {k: i for i, k in enumerate(self.observed_order)}
+        obs_rank = {k: i for i, k in enumerate(observed)}
         d2 = sum((pred_rank[k] - obs_rank[k]) ** 2 for k in pred_rank)
         return 1.0 - 6.0 * d2 / (n * (n**2 - 1))
 
@@ -448,6 +478,7 @@ def analyze_run(
     strategy: str = "share",
     min_dwell: int = 2,
     predicted_order: Optional[Sequence[int]] = None,
+    excluded_spans: Sequence[int] = (),
 ) -> RunPhases:
     """Reconstruct the head-specialization story for one run's history frame.
 
@@ -499,18 +530,23 @@ def analyze_run(
         trajectories=trajectories,
         observed_order=observed_order,
         predicted_order=list(predicted_order) if predicted_order is not None else [],
+        excluded_spans=list(excluded_spans),
     )
 
 
 # --- config-derived prediction ------------------------------------------------
 
 
-def predicted_span_order(cfg: Dict[str, Any], window: int) -> List[int]:
-    """Span indices ordered by the *config's* importance, most important first.
+def lag_weights_from_config(cfg: Mapping[str, Any], window: int) -> np.ndarray:
+    """Per-lag importance weights, recomputed from the run's config.
 
-    Reads the teacher's outer `lag_spectrum` and materializes it with
-    `src.spectra`, so the prediction always tracks whatever law the sweep used
-    (geometric, power, flat, reversed, ...) rather than a hard-coded guess.
+    These are *derived*, not logged: the outer law's weights depend only on
+    `lag_spectrum` and `window`, never on the RNG (randomness lives in the
+    singular vectors, which do not affect singular values or norms). Deriving
+    them here rather than logging them keeps one source of truth and works
+    retroactively on runs that predate any such logging.
+
+    Raises `KeyError` if the config carries no `lag_spectrum` block.
     """
     from src.spectra import SpectrumSpec, spectrum
 
@@ -519,9 +555,124 @@ def predicted_span_order(cfg: Dict[str, Any], window: int) -> List[int]:
         for key in ("law", "decay", "alpha", "rank", "normalize", "reverse")
         if f"cfg.teacher.lag_spectrum.{key}" in cfg
     }
-    weights = spectrum(SpectrumSpec(**spec_fields), window).numpy()
+    if not spec_fields:
+        raise KeyError("config has no cfg.teacher.lag_spectrum.* fields")
+    return spectrum(SpectrumSpec(**spec_fields), window).numpy()
+
+
+def skip_connection_spans(
+    cfg: Mapping[str, Any],
+    num_spans: int,
+    key: str = "cfg.student.skip_connection",
+) -> List[int]:
+    """Spans that attention need not cover because the residual path supplies them.
+
+    The query attends from the position it is predicting *from*, so the most
+    recent span is the query's own token. With a skip connection that token
+    already reaches the output through the residual stream, so a head has no
+    reason to spend itself on it — and scoring a run for "failing" to cover it
+    would punish the correct behaviour.
+
+    Returns `[num_spans - 1]` when the student has a skip connection, else `[]`.
+    """
+    return [num_spans - 1] if cfg.get(key, False) else []
+
+
+def predicted_span_order(
+    cfg: Mapping[str, Any], window: int, exclude: Sequence[int] = ()
+) -> List[int]:
+    """Span indices ordered by the *config's* importance, most important first.
+
+    Tracks whatever law the sweep used (geometric, power, flat, reversed, ...)
+    rather than a hard-coded guess. `exclude` drops spans from the ranking
+    entirely — see `skip_connection_spans`.
+    """
+    weights = lag_weights_from_config(cfg, window)
     # Stable descending sort: ties keep span order.
-    return list(np.argsort(-weights, kind="stable"))
+    order = list(np.argsort(-weights, kind="stable"))
+    excluded = set(exclude)
+    return [k for k in order if k not in excluded]
+
+
+def varying_config_columns(
+    df: pd.DataFrame,
+    prefix: str = "cfg.",
+    run_id_col: str = "_run_id",
+    exclude: Sequence[str] = ("cfg.misc.", "cfg.hydra"),
+) -> List[str]:
+    """The config columns that actually differ across the runs in `df`.
+
+    This is the "what is different between these runs" question. Sweeping a knob
+    the table does not know about is the common way to end up staring at rows
+    that look identical, so the default is to discover the axes rather than name
+    them up front.
+
+    Bookkeeping that varies for uninteresting reasons (wandb settings, hydra
+    internals) is excluded; values that are lists or dicts are compared by their
+    repr so they can be counted.
+    """
+    cfg_cols = [
+        c
+        for c in df.columns
+        if c.startswith(prefix) and not any(c.startswith(e) for e in exclude)
+    ]
+    if not cfg_cols or run_id_col not in df.columns:
+        return []
+
+    per_run = df.groupby(run_id_col, dropna=False)[cfg_cols].first()
+    comparable = per_run.map(lambda v: repr(v) if isinstance(v, (list, dict, set)) else v)
+    counts = comparable.nunique(dropna=False)
+    return [c for c in cfg_cols if counts.get(c, 0) > 1]
+
+
+def short_axis_names(axes: Sequence[str], prefix: str = "cfg.") -> Dict[str, str]:
+    """Map full config columns to the shortest names that still distinguish them.
+
+    `cfg.teacher.spectrum.alpha` and `cfg.teacher.lag_spectrum.alpha` share
+    `cfg.teacher.`, so they shorten to `spectrum.alpha` / `lag_spectrum.alpha` —
+    short enough for a plot title, still unambiguous.
+    """
+    stripped = {a: a[len(prefix):] if a.startswith(prefix) else a for a in axes}
+    parts = [v.split(".") for v in stripped.values()]
+    common = 0
+    if len(parts) > 1:
+        for i in range(min(len(p) for p in parts) - 1):
+            if len({p[i] for p in parts}) == 1:
+                common = i + 1
+            else:
+                break
+    return {a: ".".join(v.split(".")[common:]) for a, v in stripped.items()}
+
+
+def _format_value(value: Any) -> str:
+    """Compact rendering: 1.0 -> '1', 0.50 -> '0.5', lists stay bracketed."""
+    if isinstance(value, float):
+        if value != value:  # NaN
+            return "?"
+        return f"{value:g}"
+    if isinstance(value, (list, tuple)):
+        return "[" + ",".join(_format_value(v) for v in value) + "]"
+    return str(value)
+
+
+def run_label(
+    values: Mapping[str, Any],
+    axes: Sequence[str],
+    names: Optional[Mapping[str, str]] = None,
+    sep: str = "  ",
+) -> str:
+    """Render one run's varying config as a compact label for titles and logs.
+
+    e.g. `spectrum.alpha=1  lag_spectrum.alpha=0.5`. A W&B run name like
+    `devout-jazz-149` says nothing about what the run *is*; this does.
+    """
+    names = names or short_axis_names(axes)
+    parts = [
+        f"{names.get(a, a)}={_format_value(values[a])}"
+        for a in axes
+        if a in values and values[a] is not None
+    ]
+    return sep.join(parts)
 
 
 def phase_table(
@@ -536,26 +687,34 @@ def phase_table(
     cutoff: float = 0.5,
     strategy: str = "share",
     min_dwell: int = 2,
-    group_cols: Sequence[str] = (
-        "cfg.teacher.spectrum.alpha",
-        "cfg.teacher.lag_spectrum.alpha",
-    ),
+    group_cols: Optional[Sequence[str]] = None,
     use_config_prediction: bool = True,
 ) -> pd.DataFrame:
     """One row per run: coverage order, per-head migration path, and order match.
 
     `df` is the frame returned by `notebooks.utils.get_runs_data`, which carries
     both history and flattened config columns.
+
+    `group_cols` names the config columns to show beside each run. Left as
+    `None` it auto-detects every config column that *varies* across the runs, so
+    whatever the sweep actually changed — `spectrum.alpha`, `rank`,
+    `orthogonality`, `num_heads`, the seed — shows up without being named here.
+    Pass an explicit list to pin the columns instead.
     """
+    if group_cols is None:
+        group_cols = varying_config_columns(df)
+    axis_names = short_axis_names(group_cols)
     rows = []
     for run_id, run_df in df.groupby("_run_id", dropna=False):
         cfg = run_df.iloc[0].to_dict()
-        predicted = None
+        excluded = skip_connection_spans(cfg, num_spans)
+        predicted, lag_weights = None, None
         if use_config_prediction:
             try:
-                predicted = predicted_span_order(cfg, num_spans)
+                lag_weights = lag_weights_from_config(cfg, num_spans)
+                predicted = predicted_span_order(cfg, num_spans, exclude=excluded)
             except Exception:  # config shape varies across older runs
-                predicted = None
+                predicted, lag_weights = None, None
 
         phases = analyze_run(
             run_df,
@@ -570,11 +729,15 @@ def phase_table(
             strategy=strategy,
             min_dwell=min_dwell,
             predicted_order=predicted,
+            excluded_spans=excluded,
         )
 
         row: Dict[str, Any] = {
             "_run_id": run_id,
             "_run_name": phases.run_name,
+            # What distinguishes this run from the others, in one string —
+            # usable directly as a plot title.
+            "label": run_label(cfg, group_cols, axis_names) or phases.run_name,
             "summary": phases.summary,
         }
         for col in group_cols:
@@ -585,10 +748,15 @@ def phase_table(
             row[f"head{h + 1}_path"] = phases.head_path(h)
         for k in range(num_spans):
             row[f"acq_{phases.span_labels[k]}"] = phases.acquired.get(k)
+            # Physical importance axis, derived from the law rather than logged,
+            # so it is available for every run including older ones.
+            if lag_weights is not None:
+                row[f"lag_weight_{phases.span_labels[k]}"] = float(lag_weights[k])
         row["migrations"] = phases.migrations
         row["shared_spans"] = phases.shared_spans
         row["uncovered_spans"] = phases.uncovered_spans
         row["observed_order"] = [phases.span_labels[k] for k in phases.observed_order]
+        row["excluded"] = [phases.span_labels[k] for k in phases.excluded_spans]
         row["predicted_order"] = [phases.span_labels[k] for k in phases.predicted_order]
         row["order_matches"] = phases.order_matches_importance
         row["order_rank_corr"] = phases.order_rank_corr

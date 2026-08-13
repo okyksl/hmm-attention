@@ -93,8 +93,11 @@ def test_update_kl_metrics_populates_registry(tiny_teacher, tiny_student, device
     fake_student_out = out_teacher.clone()  # perfect student → KL = 0.
 
     ev.update_kl_metrics(fake_student_out, data, split="train", metrics=reg)
-    assert reg["teacher/kl/train"].compute() >= 0
-    assert reg["teacher_k1/kl/train"].compute() >= 0
+    # KL of a perfect student is mathematically 0, but sum(p * (log p - log q))
+    # with p == q accumulates roundoff that can land either side of zero, so the
+    # bound needs a tolerance rather than a bare `>= 0`.
+    assert reg["teacher/kl/train"].compute() >= -1e-6
+    assert reg["teacher_k1/kl/train"].compute() >= -1e-6
 
 
 # ---- adaptive (attention) teacher --------------------------------------------

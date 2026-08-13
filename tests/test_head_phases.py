@@ -38,6 +38,17 @@ def test_metric_keys_are_row_major():
     ]
 
 
+def test_metric_keys_use_teacher_noun_for_value_alignment():
+    # Attention metrics index by ground-truth span; value metrics by teacher lag
+    # matrix. Both are (head x lag) and feed the same trajectory machinery.
+    from src.analysis.head_phases import VALUE_COS
+
+    assert metric_keys(1, 2, metric=VALUE_COS) == [
+        "attn/L1/value_cos_head1_teacher1/train",
+        "attn/L1/value_cos_head1_teacher2/train",
+    ]
+
+
 def test_span_offsets_unit_spans_are_negative_positions():
     assert span_offsets([1, 1, 1]) == ["-3", "-2", "-1"]
 
@@ -332,4 +343,273 @@ def test_phase_table_reports_per_head_spans_and_acquisition_columns():
     assert row["head2_final"] == "-2"
     assert row["acq_-2"] == 50.0
     assert row["acq_-1"] == 800.0
-    assert row["cfg.teacher.spectrum.alpha"] == 1.0
+    # Only one run here, so nothing *varies* -> no config axis is surfaced.
+    assert not [c for c in table.columns if c.startswith("cfg.")]
+
+
+# ---- config-derived lag weights ----------------------------------------------
+
+
+def test_lag_weights_from_config_matches_the_law():
+    """Derived, not logged: the weights depend only on the config."""
+    from src.analysis.head_phases import lag_weights_from_config
+
+    cfg = {
+        "cfg.teacher.lag_spectrum.law": "power",
+        "cfg.teacher.lag_spectrum.alpha": 1.0,
+        "cfg.teacher.lag_spectrum.normalize": "none",
+        "cfg.teacher.lag_spectrum.reverse": True,
+    }
+    assert lag_weights_from_config(cfg, 3) == pytest.approx([1 / 3, 1 / 2, 1.0])
+
+
+def test_lag_weights_from_config_agree_with_the_built_teacher():
+    """The derived axis must equal what the teacher actually got built with."""
+    from src.analysis.head_phases import lag_weights_from_config
+    from src.teachers import LinearARTeacher
+
+    teacher = LinearARTeacher.from_parameters(
+        dim=8, window=3, span_lengths=[1, 1, 1],
+        lag_spectrum={"law": "power", "alpha": 0.5, "normalize": "none", "reverse": True},
+    )
+    cfg = {
+        "cfg.teacher.lag_spectrum.law": "power",
+        "cfg.teacher.lag_spectrum.alpha": 0.5,
+        "cfg.teacher.lag_spectrum.normalize": "none",
+        "cfg.teacher.lag_spectrum.reverse": True,
+    }
+    assert lag_weights_from_config(cfg, 3) == pytest.approx(
+        teacher.lag_weights.tolist(), abs=1e-6
+    )
+
+
+def test_lag_weights_from_config_are_comparable_across_laws():
+    """A power and a geometric law with the same spread give the same ratio."""
+    from src.analysis.head_phases import lag_weights_from_config
+
+    power = lag_weights_from_config({
+        "cfg.teacher.lag_spectrum.law": "power",
+        "cfg.teacher.lag_spectrum.alpha": 1.0,
+        "cfg.teacher.lag_spectrum.normalize": "none",
+        "cfg.teacher.lag_spectrum.reverse": True,
+    }, 3)
+    geometric = lag_weights_from_config({
+        "cfg.teacher.lag_spectrum.law": "geometric",
+        "cfg.teacher.lag_spectrum.decay": 3.0 ** 0.5,
+        "cfg.teacher.lag_spectrum.normalize": "none",
+        "cfg.teacher.lag_spectrum.reverse": False,
+    }, 3)
+    assert power.max() / power.min() == pytest.approx(
+        geometric.max() / geometric.min(), abs=1e-5
+    )
+
+
+def test_lag_weights_from_config_rejects_a_config_without_the_block():
+    from src.analysis.head_phases import lag_weights_from_config
+
+    with pytest.raises(KeyError, match="lag_spectrum"):
+        lag_weights_from_config({"cfg.dataset.dim": 50}, 3)
+
+
+def test_phase_table_emits_derived_lag_weight_columns():
+    df = _synthetic_run(onsets=(800, 400, 50), run_id="a")
+    df["cfg.teacher.lag_spectrum.law"] = "power"
+    df["cfg.teacher.lag_spectrum.alpha"] = 1.0
+    df["cfg.teacher.lag_spectrum.normalize"] = "none"
+    df["cfg.teacher.lag_spectrum.reverse"] = True
+
+    table = phase_table(df, num_heads=3, num_spans=3, span_lengths=[1, 1, 1])
+    assert table.iloc[0]["lag_weight_-1"] == pytest.approx(1.0)
+    assert table.iloc[0]["lag_weight_-3"] == pytest.approx(1 / 3)
+
+
+# ---- config axis discovery ---------------------------------------------------
+
+
+def test_varying_config_columns_finds_only_what_differs():
+    """The sweep's axes, discovered rather than named."""
+    from src.analysis.head_phases import varying_config_columns
+
+    df = pd.DataFrame({
+        "_run_id": ["a", "a", "b", "b"],
+        "cfg.teacher.spectrum.alpha": [1.0, 1.0, 2.0, 2.0],   # varies
+        "cfg.teacher.spectrum.rank": [16, 16, 16, 16],        # constant
+        "cfg.dataset.dim": [50, 50, 50, 50],                  # constant
+        "cfg.misc.wandb.tags": [["x"], ["x"], ["y"], ["y"]],  # excluded prefix
+    })
+    assert varying_config_columns(df) == ["cfg.teacher.spectrum.alpha"]
+
+
+def test_varying_config_columns_handles_list_valued_configs():
+    from src.analysis.head_phases import varying_config_columns
+
+    df = pd.DataFrame({
+        "_run_id": ["a", "b"],
+        "cfg.teacher.span_lengths": [[1, 1, 1], [2, 2, 2]],  # unhashable, varies
+    })
+    assert varying_config_columns(df) == ["cfg.teacher.span_lengths"]
+
+
+def test_phase_table_auto_surfaces_whatever_the_sweep_varied():
+    """A sweep over `rank` shows up without `group_cols` naming it."""
+    a = _synthetic_run(onsets=(800, 400, 50), run_id="a")
+    b = _synthetic_run(onsets=(50, 400, 800), run_id="b")
+    for frame, rank in ((a, 8), (b, 32)):
+        frame["cfg.teacher.spectrum.rank"] = rank
+        frame["cfg.teacher.spectrum.alpha"] = 1.0  # constant -> must not appear
+
+    table = phase_table(
+        pd.concat([a, b], ignore_index=True),
+        num_heads=3, num_spans=3, span_lengths=[1, 1, 1],
+    )
+    assert "cfg.teacher.spectrum.rank" in table.columns
+    assert "cfg.teacher.spectrum.alpha" not in table.columns
+    assert sorted(table["cfg.teacher.spectrum.rank"]) == [8, 32]
+
+
+def test_phase_table_still_accepts_explicit_group_cols():
+    df = _synthetic_run(run_id="a")
+    df["cfg.teacher.spectrum.rank"] = 8
+    table = phase_table(
+        df, num_heads=3, num_spans=3, span_lengths=[1, 1, 1],
+        group_cols=["cfg.teacher.spectrum.rank"],
+    )
+    assert table.iloc[0]["cfg.teacher.spectrum.rank"] == 8
+
+
+# ---- run labels --------------------------------------------------------------
+
+
+def test_short_axis_names_strip_the_shared_prefix():
+    from src.analysis.head_phases import short_axis_names
+
+    axes = ["cfg.teacher.spectrum.alpha", "cfg.teacher.lag_spectrum.alpha"]
+    assert short_axis_names(axes) == {
+        axes[0]: "spectrum.alpha",
+        axes[1]: "lag_spectrum.alpha",
+    }
+
+
+def test_short_axis_names_keep_a_lone_axis_readable():
+    from src.analysis.head_phases import short_axis_names
+
+    # Nothing to disambiguate against, so only `cfg.` is dropped.
+    assert short_axis_names(["cfg.teacher.spectrum.rank"]) == {
+        "cfg.teacher.spectrum.rank": "teacher.spectrum.rank"
+    }
+
+
+def test_run_label_formats_values_compactly():
+    from src.analysis.head_phases import run_label
+
+    axes = ["cfg.teacher.spectrum.alpha", "cfg.teacher.span_lengths"]
+    label = run_label({axes[0]: 1.0, axes[1]: [1, 1, 1]}, axes)
+    assert label == "spectrum.alpha=1  span_lengths=[1,1,1]"
+
+
+def test_run_label_skips_missing_axes():
+    from src.analysis.head_phases import run_label
+
+    axes = ["cfg.a.x", "cfg.a.y"]
+    assert run_label({"cfg.a.x": 2}, axes) == "x=2"
+
+
+def test_phase_table_label_column_describes_the_run():
+    a = _synthetic_run(onsets=(800, 400, 50), run_id="a")
+    b = _synthetic_run(onsets=(50, 400, 800), run_id="b")
+    for frame, alpha in ((a, 1.0), (b, 2.0)):
+        frame["cfg.teacher.lag_spectrum.alpha"] = alpha
+
+    table = phase_table(
+        pd.concat([a, b], ignore_index=True),
+        num_heads=3, num_spans=3, span_lengths=[1, 1, 1],
+    )
+    assert sorted(table["label"]) == [
+        "teacher.lag_spectrum.alpha=1",
+        "teacher.lag_spectrum.alpha=2",
+    ]
+
+
+def test_phase_table_label_falls_back_to_the_run_name():
+    """A single run has no varying axis; the label must still identify it."""
+    df = _synthetic_run(run_id="solo")
+    table = phase_table(df, num_heads=3, num_spans=3, span_lengths=[1, 1, 1])
+    assert table.iloc[0]["label"] == "name-solo"
+
+
+# ---- skip-connection exclusion ------------------------------------------------
+
+
+_LAW = {
+    "cfg.teacher.lag_spectrum.law": "power",
+    "cfg.teacher.lag_spectrum.alpha": 1.0,
+    "cfg.teacher.lag_spectrum.normalize": "none",
+    "cfg.teacher.lag_spectrum.reverse": True,
+}
+
+
+def test_skip_connection_spans_targets_the_most_recent_span():
+    from src.analysis.head_phases import skip_connection_spans
+
+    assert skip_connection_spans({"cfg.student.skip_connection": True}, 3) == [2]
+    assert skip_connection_spans({"cfg.student.skip_connection": False}, 3) == []
+    assert skip_connection_spans({}, 3) == []  # absent -> assume no skip
+
+
+def test_predicted_span_order_drops_the_skip_supplied_span():
+    from src.analysis.head_phases import predicted_span_order
+
+    # Reversed power law ranks spans most-recent-first: [2, 1, 0].
+    assert predicted_span_order(_LAW, 3) == [2, 1, 0]
+    # With a skip connection, span 2 (offset -1) is off the table entirely.
+    assert predicted_span_order(_LAW, 3, exclude=[2]) == [1, 0]
+
+
+def test_order_metrics_ignore_the_excluded_span():
+    """A run that never covers -1 must not be penalised when a skip supplies it."""
+    # Coverage order -2 then -3; span -1 (index 2) never acquired.
+    steps = np.arange(0, 1000, 50)
+    values = np.full((len(steps), 3, 3), 0.05)
+    values[steps >= 100, 0, 1] = 0.9   # head 0 -> span 1 (-2) at 100
+    values[steps >= 500, 1, 0] = 0.9   # head 1 -> span 0 (-3) at 500
+    df = _frame_from_values(steps, values)
+
+    phases = analyze_run(
+        df, num_heads=3, num_spans=3, span_lengths=[1, 1, 1],
+        predicted_order=[1, 0], excluded_spans=[2],
+    )
+    # The full story still mentions -1...
+    assert 2 in phases.observed_order
+    # ...but the comparison runs only over the spans attention owns.
+    assert phases.comparable_order == [1, 0]
+    assert phases.order_matches_importance is True
+    assert phases.order_rank_corr == pytest.approx(1.0)
+
+
+def test_order_metrics_would_fail_without_the_exclusion():
+    """Same run, exclusion off: the uncovered -1 sorts last and breaks the match."""
+    steps = np.arange(0, 1000, 50)
+    values = np.full((len(steps), 3, 3), 0.05)
+    values[steps >= 100, 0, 1] = 0.9
+    values[steps >= 500, 1, 0] = 0.9
+    df = _frame_from_values(steps, values)
+
+    phases = analyze_run(
+        df, num_heads=3, num_spans=3, span_lengths=[1, 1, 1],
+        predicted_order=[2, 1, 0],
+    )
+    assert phases.order_matches_importance is False
+
+
+def test_phase_table_auto_excludes_when_the_student_has_a_skip_connection():
+    df = _synthetic_run(onsets=(500, 100, 10_000), run_id="a",
+                        steps=np.arange(0, 1000, 50))
+    for key, value in _LAW.items():
+        df[key] = value
+    df["cfg.student.skip_connection"] = True
+
+    table = phase_table(df, num_heads=3, num_spans=3, span_lengths=[1, 1, 1])
+    row = table.iloc[0]
+    assert row["excluded"] == ["-1"]
+    assert row["predicted_order"] == ["-2", "-3"]
+    assert bool(row["order_matches"]) is True

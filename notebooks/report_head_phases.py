@@ -19,6 +19,8 @@ from src.analysis.head_phases import (
     COS_SIM,
     FOCUS_STRATEGIES,
     SPAN_MASS,
+    VALUE_COS,
+    VALUE_INNER,
     metric_key,
     metric_keys,
     phase_table,
@@ -70,8 +72,10 @@ def main(argv=None) -> int:
     p.add_argument(
         "--metric",
         default=SPAN_MASS,
-        choices=[SPAN_MASS, COS_SIM],
-        help="span_mass is raw attention mass; align_cos_sim is scale-free",
+        choices=[SPAN_MASS, COS_SIM, VALUE_COS, VALUE_INNER],
+        help="span_mass/align_cos_sim = where a head looks (attention); "
+        "value_cos/value_inner = which teacher matrix its value projection "
+        "implements. The two are independent read-outs of the same story.",
     )
     p.add_argument(
         "--cutoff",
@@ -134,7 +138,10 @@ def main(argv=None) -> int:
     )
 
     with pd.option_context("display.width", 200, "display.max_columns", 50):
-        cols = [c for c in table.columns if c != "_run_id"]
+        # `label` already carries the varying config, so the raw wandb name and
+        # the individual axis columns are redundant noise in the printout.
+        axis_cols = [c for c in table.columns if c.startswith("cfg.")]
+        cols = [c for c in table.columns if c not in {"_run_id", "_run_name", *axis_cols}]
         print(table[cols].to_string(index=False))
     return 0
 
