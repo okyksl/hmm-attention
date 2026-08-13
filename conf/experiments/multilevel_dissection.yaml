@@ -11,8 +11,10 @@ defaults:
 # One level: hidden vocab = 64, surface vocab = 64, chunk_size = 2. Base linear
 # process over the hidden vocab (matches hierarchical_dissection).
 teacher:
-  levels:
-    - {chunk_dim: 64, chunk_size: 2, num_tuples: 1, chunk_seed: null}
+  chunk_dims: [64]
+  chunk_sizes: [2]
+  num_tuples: [1]
+  chunk_seeds: [0]
   base_teacher:
     dim: 64                        # hidden vocab
     window: 3

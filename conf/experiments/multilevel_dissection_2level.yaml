@@ -1,0 +1,59 @@
+# @package _global_
+# Depth-2 multi-level dissection with *diverse* levels (different arities and
+# alphabets), so the two abstraction levels read distinctly in the probes:
+#   base(64) --x2--> intermediate alphabet(16) --x3--> surface(64)
+# total = 6 surface tokens per base token; burn_in = 3 * 6 = 18.
+defaults:
+  - override /teacher: multilevel
+  - override /teacher/base_teacher: linear
+  - _self_
+
+teacher:
+  chunk_dims: [16, 64]     # top -> bottom: base 64 -> alphabet 16 -> surface 64
+  chunk_sizes: [2, 3]
+  num_tuples: [1, 1]
+  chunk_seeds: [0, 1]
+  base_teacher:
+    dim: 64                        # hidden vocab
+    window: 3
+    span_lengths: [1, 1, 1]        # in hidden space
+    spectrum: {rank: 64}
+    lag_spectrum: {law: flat}
+    scale: 10                      # sharpness
+
+dataset:
+  window: 3
+  dim: 64                          # surface vocab (= last level's chunk_dim)
+  length: 48                       # multiple of total(6); full sequence = 18 + 48 = 66
+  number:
+    train: -15000
+
+trainer:
+  batch_size: 15000
+  steps: 10000
+
+student:
+  dim: 64
+  pe_max_sequence_length: 128      # >= full sequence length (66)
+  dropout: 0.0
+  use_key_projection: false
+  layer_normalization: false
+  use_mlp: true
+  ff_hidden_dim: 256
+  teacher_readout: false
+  use_output_projection: false
+  skip_connection: true
+  attention_disentanglement: true
+  pe_type: one_hot
+  identity_decoder: true
+  attention_bias: false
+  num_blocks: 2
+
+optimizer:
+  lr: 0.01
+
+misc:
+  probe:
+    mode: sgd
+  wandb:
+    tags: ["multilevel-dissection", "depth-2-diverse", "version-1"]

@@ -72,25 +72,56 @@ class MultiLevelHierarchicalTeacher(ARTeacher):
         self._span = span
 
     @classmethod
-    def from_level_specs(cls, base_teacher: ARTeacher, levels) -> "MultiLevelHierarchicalTeacher":
-        """Build from lightweight per-level specs (the config entry point).
+    def from_level_specs(
+        cls,
+        base_teacher: ARTeacher,
+        chunk_dims,
+        chunk_sizes,
+        num_tuples=None,
+        chunk_seeds=None,
+    ) -> "MultiLevelHierarchicalTeacher":
+        """Build from **parallel per-level lists** (the config entry point).
 
-        `levels` is an ordered (top->bottom) list of mappings with keys
-        `chunk_dim` (the level's output alphabet), `chunk_size`, and optional
-        `num_tuples` (default 1) and `chunk_seed`. The input-alphabet chain is
-        resolved here: `in_dim[0] == base_teacher.dim`, `in_dim[l] == chunk_dim[l-1]`.
+        Ordered top->bottom. `chunk_dims[l]` is level l's output alphabet and
+        `chunk_sizes[l]` its arity; `num_tuples`/`chunk_seeds` are optional
+        (a scalar broadcasts to every level, a shorter list is padded, `None`
+        means all-default). The input-alphabet chain is resolved here:
+        `in_dim[0] == base_teacher.dim`, `in_dim[l] == chunk_dims[l-1]`.
+
+        Parallel lists (not a list-of-dicts) so CLI overrides stay shell-safe:
+        `teacher.chunk_sizes=[2,3]` / `teacher.chunk_sizes.0=2` — no `{}` braces.
         """
+        n = len(chunk_sizes)
+        if len(chunk_dims) != n:
+            raise ValueError(
+                f"chunk_dims (len {len(chunk_dims)}) and chunk_sizes (len {n}) "
+                "must have the same length"
+            )
+
+        def _per_level(value, default, name):
+            if value is None:
+                return [default] * n
+            if isinstance(value, int):
+                return [value] * n
+            value = list(value)
+            if len(value) > n:
+                raise ValueError(f"{name} (len {len(value)}) longer than {n} levels")
+            return value + [default] * (n - len(value))
+
+        num_tuples = _per_level(num_tuples, 1, "num_tuples")
+        chunk_seeds = _per_level(chunk_seeds, None, "chunk_seeds")
+
         codes: List[ChunkCode] = []
         in_dim = base_teacher.dim
-        for spec in levels:
-            out_dim = int(spec["chunk_dim"])
+        for l in range(n):
+            out_dim = int(chunk_dims[l])
             codes.append(
                 ChunkCode(
                     in_dim=in_dim,
                     out_dim=out_dim,
-                    size=int(spec["chunk_size"]),
-                    num_tuples=int(spec.get("num_tuples", 1)),
-                    chunk_seed=spec.get("chunk_seed", None),
+                    size=int(chunk_sizes[l]),
+                    num_tuples=int(num_tuples[l]),
+                    chunk_seed=chunk_seeds[l],
                 )
             )
             in_dim = out_dim

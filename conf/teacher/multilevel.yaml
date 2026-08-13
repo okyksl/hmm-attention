@@ -2,20 +2,26 @@ defaults:
   - base_teacher: attention
   - _self_
 
-# Configurable multi-level chunk-composed teacher (hierarchical HMM). `levels` is
-# ordered top->bottom: levels[0] is adjacent to the base, levels[-1] emits surface
-# tokens. Each level's `chunk_dim` is its output alphabet (= the next level's input
-# alphabet); the surface vocab is the last level's chunk_dim. The base (top)
-# alphabet is `base_teacher.dim` and must be set explicitly per experiment.
+# Configurable multi-level chunk-composed teacher (hierarchical HMM), specified
+# as **parallel per-level lists** ordered top->bottom (levels[0] adjacent to the
+# base, levels[-1] emits surface). Parallel lists — not a list-of-dicts — so CLI
+# overrides stay shell-safe: `teacher.chunk_sizes=[2,3]` or `teacher.chunk_sizes.0=2`
+# (no `{}` braces to trigger shell expansion).
+#
+# chunk_dims[l] is level l's output alphabet (= the next level's input alphabet);
+# the last must be the surface vocab (-1 -> dataset.dim). The base (top) alphabet
+# is `base_teacher.dim`, set explicitly per experiment. num_tuples / chunk_seeds
+# are explicit per-level lists (reproducible tables); a scalar broadcasts to every
+# level and `null` means all-default (1 tuple / random table). Full sequence length
+# must be a multiple of prod(chunk_sizes).
 #
 # Base process is a swappable group: `override /teacher/base_teacher: linear`
 # selects a linear base (see conf/teacher/base_teacher/).
 _target_: src.teachers.MultiLevelHierarchicalTeacher.from_level_specs
 
-levels:                   # top -> bottom; a genuinely multi-level default (a
-  # single level would just reproduce the `hierarchical` teacher). Each base
-  # token expands 2*3 = 6 surface tokens. chunk_dim -1 -> dataset.dim, so the
-  # intermediate alphabet defaults to the surface vocab; set it explicitly to
-  # decouple them. Note: full sequence length must be a multiple of prod(chunk_size).
-  - {chunk_dim: -1, chunk_size: 2, num_tuples: 1, chunk_seed: null}
-  - {chunk_dim: -1, chunk_size: 3, num_tuples: 1, chunk_seed: null}
+# A genuinely multi-level default (a single level would just reproduce the
+# `hierarchical` teacher): base -> x2 -> x3 -> surface (6 surface tokens/base token).
+chunk_dims: [-1, -1]      # top -> bottom; -1 -> dataset.dim (surface)
+chunk_sizes: [2, 3]
+num_tuples: [1, 1]
+chunk_seeds: [0, 1]

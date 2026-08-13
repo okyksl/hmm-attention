@@ -35,10 +35,10 @@ def preprocess_cfg(cfg: DictConfig) -> DictConfig:
     # MultiLevelHierarchicalTeacher: resolve each level's `chunk_dim` sentinel
     # against the surface vocab (dataset.dim). Intermediate alphabets should be
     # set explicitly; -1 defaults to the surface dim.
-    if "levels" in cfg.teacher:
-        for level in cfg.teacher.levels:
-            if "chunk_dim" in level:
-                level.chunk_dim = _resolve_sentinel(level.chunk_dim, cfg.dataset.dim)
+    if "chunk_dims" in cfg.teacher:
+        cfg.teacher.chunk_dims = [
+            _resolve_sentinel(int(d), cfg.dataset.dim) for d in cfg.teacher.chunk_dims
+        ]
 
     # student
     if "student" in cfg:
