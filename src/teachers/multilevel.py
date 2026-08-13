@@ -155,6 +155,18 @@ class MultiLevelHierarchicalTeacher(ARTeacher):
         """Public surface -> base-token one-hots (for probes / analysis)."""
         return self._decode_levels(surface, stop_after=0)
 
+    def decode_level(self, surface: torch.Tensor, level: int, return_tuple: bool = False):
+        """Decode the level-`level` unit ids covering `surface`.
+
+        Returns (..., L_level, in_dim[level]) one-hot. With `return_tuple`, also
+        returns the realized tuple index per unit (..., L_level) — which of the
+        M spellings produced each unit (used by the spelling-generalization
+        analysis). Equivalent to `_decode_levels(surface, stop_after=level)` for
+        the ids, but also exposes the tuple.
+        """
+        below = self._decode_levels(surface, stop_after=level + 1)
+        return self.levels[level].decode(below, return_tuple=return_tuple)
+
     # --- the fold ---
     def _fold(
         self,

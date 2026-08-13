@@ -94,13 +94,17 @@ class ChunkCode(nn.Module):
         return chunks.reshape(self.in_dim, self.num_tuples, self.size, self.out_dim)
 
     # --- decoding (output-alphabet surface -> input-alphabet one-hots) ---
-    def decode(self, surface: torch.Tensor) -> torch.Tensor:
+    def decode(self, surface: torch.Tensor, return_tuple: bool = False):
         """(..., L * size, out_dim) -> (..., L, in_dim) one-hot.
 
         With num_tuples > 1, matches the observed slot sequence against any of
         the M tuples per input id. Supports are globally disjoint, so exactly
         one (in_id, tuple_idx) can match a valid input. Invalid inputs fall back
         to input id 0 (argmax of an all-False match row).
+
+        If `return_tuple`, also return the realized tuple index per position
+        (..., L) — which of the M spellings produced each chunk. This is the
+        label the spelling-generalization analysis holds out.
         """
         *lead, l_surf, cd = surface.shape
         if cd != self.out_dim:
@@ -116,8 +120,12 @@ class ChunkCode(nn.Module):
             slot_idx.unsqueeze(-2).unsqueeze(-2) == self._chunk_slot_indices
         ).all(dim=-1)  # (..., L, in_dim, M)
         flat = matches.reshape(*matches.shape[:-2], self.in_dim * self.num_tuples)
-        in_ids = flat.float().argmax(dim=-1) // self.num_tuples
-        return F.one_hot(in_ids, num_classes=self.in_dim).to(surface.dtype)
+        combined = flat.float().argmax(dim=-1)  # (..., L) index into in_dim * M
+        in_ids = combined // self.num_tuples
+        one_hot = F.one_hot(in_ids, num_classes=self.in_dim).to(surface.dtype)
+        if return_tuple:
+            return one_hot, combined % self.num_tuples
+        return one_hot
 
     # --- marginalization (input distribution -> output-slot distribution) ---
     def _compat_mask(

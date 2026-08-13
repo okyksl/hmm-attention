@@ -246,6 +246,55 @@ def spelling_generalization(
     return analyze_residuals(teacher, residuals, data, **kwargs)
 
 
+def render_spellings(
+    teacher: MultiLevelHierarchicalTeacher,
+    base_ids: torch.Tensor,
+    k: int,
+    seed: int = 0,
+) -> torch.Tensor:
+    """Render one latent (base-id) sequence into `k` different surface spellings.
+
+    All `k` outputs decode back to `base_ids` (same "meaning", different surface
+    realizations via different tuple draws). `base_ids` has shape (*lead, n_base);
+    returns (k, *lead, n_base * total, surface_dim).
+    """
+    gen = torch.Generator(device=base_ids.device).manual_seed(seed)
+    lead = base_ids.shape[:-1]
+    outs = []
+    for _ in range(k):
+        ids = base_ids
+        surface = None
+        for l, level in enumerate(teacher.levels):
+            tup = torch.randint(
+                0, level.num_tuples, ids.shape, generator=gen, device=ids.device
+            )
+            chunks = level.sample(ids, tuple_ids=tup)  # (*lead, count, size, out_dim)
+            if l == teacher.num_levels - 1:
+                surface = chunks.reshape(*lead, -1, level.out_dim)
+            ids = chunks.argmax(dim=-1).reshape(*lead, -1)
+        outs.append(surface)
+    return torch.stack(outs, dim=0)
+
+
+def cross_spelling_divergence(log_probs: torch.Tensor) -> torch.Tensor:
+    """Mean pairwise symmetric-KL across the leading (spelling) axis.
+
+    `log_probs` is (k, ..., dim) log-probabilities from k spellings of the same
+    latent sequence. Returns (...) the mean over all spelling pairs of
+    `KL(p_i||p_j) + KL(p_j||p_i)` — how much the predictions disagree across
+    surface realizations the teacher treats as equivalent. 0 ⇒ spelling-invariant.
+    """
+    k = log_probs.shape[0]
+    p = log_probs.exp()
+    total = torch.zeros(log_probs.shape[1:-1], device=log_probs.device)
+    pairs = 0
+    for i in range(k):
+        for j in range(i + 1, k):
+            total = total + ((p[i] - p[j]) * (log_probs[i] - log_probs[j])).sum(dim=-1)
+            pairs += 1
+    return total / max(pairs, 1)
+
+
 def summarize(results: List[SpellingResult]) -> Dict[tuple, Dict[str, float]]:
     """Aggregate per (layer, level): mean heldout_acc / seen_acc / gap / bayes_acc."""
     by_key: Dict[tuple, List[SpellingResult]] = {}
