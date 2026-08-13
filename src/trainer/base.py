@@ -320,14 +320,15 @@ class Trainer(ABC):
                     _, log_probs, target = self.teacher_eval.run(
                         data, prefix=prefix, normalize=False
                     )
-                    context = self.teacher_eval.context_name(prefix)
                     # CE and KL both apply log_softmax internally, which is a
                     # near-identity on log-probs (see src/loss.py:55).
-                    self.metrics[f"{context}/loss/{split}"].update(
-                        self.loss_fn(log_probs, target).item(), target.shape[0]
-                    )
-                    self.metrics[f"{context}/acc/{split}"].update(
-                        log_probs, target
+                    self.teacher_eval.update_loss_acc_metrics(
+                        log_probs=log_probs,
+                        targets=target,
+                        prefix=prefix,
+                        split=split,
+                        metrics=self.metrics,
+                        loss_fn=self.loss_fn,
                     )
                 pbar.update()
             pbar.close()

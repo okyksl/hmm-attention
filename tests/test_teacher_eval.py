@@ -1,5 +1,9 @@
 import torch
+import torch.nn.functional as F
 
+from src.loss import CrossentropyLoss
+from src.metrics import ConstantAccuracyMetric, ConstantLossMetric
+from src.teachers import ChunkCode, MultiLevelHierarchicalTeacher
 from src.trainer import MetricRegistry, TeacherEvaluator
 
 
@@ -39,6 +43,34 @@ def test_metric_keys_include_kl_teacher_and_per_k(tiny_teacher, device):
     assert "teacher_k2/acc/val" in ev.acc_metric_keys()
 
 
+def test_non_hierarchical_teacher_has_no_location_metrics(tiny_teacher, device):
+    ev = TeacherEvaluator(tiny_teacher, device=device)
+    assert ev.location_names() == []
+    assert not any("/level" in key for key in ev.loss_metric_keys())
+    assert not any("/offset" in key for key in ev.acc_metric_keys())
+
+
+def test_multilevel_metric_keys_cover_each_level_offset(tiny_teacher, device):
+    teacher = MultiLevelHierarchicalTeacher(
+        base_teacher=tiny_teacher,
+        levels=[
+            ChunkCode(in_dim=4, out_dim=3, size=2, chunk_seed=10),
+            ChunkCode(in_dim=3, out_dim=4, size=3, chunk_seed=11),
+        ],
+    )
+    ev = TeacherEvaluator(teacher, device=device)
+
+    assert ev.location_names() == [
+        "level0/offset0",
+        "level0/offset1",
+        "level1/offset0",
+        "level1/offset1",
+        "level1/offset2",
+    ]
+    assert "teacher/level0/offset1/loss/train" in ev.loss_metric_keys()
+    assert "teacher_k1/level1/offset2/acc/val" in ev.acc_metric_keys()
+
+
 # ---- _align_data -------------------------------------------------------------
 
 
@@ -75,6 +107,45 @@ def test_run_normalized_returns_probs_and_log_probs(tiny_teacher, device):
     probs, log_probs, _ = ev.run(data, prefix=-1, normalize=True)
     assert torch.allclose(probs.sum(dim=-1), torch.ones_like(probs[..., 0]), atol=1e-5)
     assert torch.allclose(probs, log_probs.exp(), atol=1e-5)
+
+
+def test_hierarchical_location_metrics_match_manual_masks(
+    tiny_hier_teacher, device
+):
+    ev = TeacherEvaluator(tiny_hier_teacher, device=device)
+    reg = MetricRegistry()
+    for key in ev.loss_metric_keys():
+        reg.register(key, ConstantLossMetric())
+    for key in ev.acc_metric_keys():
+        reg.register(key, ConstantAccuracyMetric(k=1))
+
+    n_base = tiny_hier_teacher.base_teacher.burn_in + 3
+    data = tiny_hier_teacher.sample_surface_prefix(
+        n_base * tiny_hier_teacher.total, batch_size=3
+    )
+    _, log_probs, targets = ev.run(data, prefix=-1, normalize=False)
+    ev.update_loss_acc_metrics(
+        log_probs,
+        targets,
+        prefix=-1,
+        split="train",
+        metrics=reg,
+        loss_fn=CrossentropyLoss(),
+    )
+
+    for offset in range(tiny_hier_teacher.levels[0].size):
+        mask = torch.arange(log_probs.shape[1]) % tiny_hier_teacher.total == offset
+        expected_loss = F.cross_entropy(
+            log_probs[:, mask, :].reshape(-1, tiny_hier_teacher.dim),
+            targets[:, mask, :].reshape(-1, tiny_hier_teacher.dim),
+        ).item()
+        expected_acc = (
+            log_probs[:, mask, :].argmax(dim=-1)
+            == targets[:, mask, :].argmax(dim=-1)
+        ).float().mean().item()
+        stub = f"teacher/level0/offset{offset}"
+        assert abs(reg[f"{stub}/loss/train"].compute() - expected_loss) < 1e-6
+        assert abs(reg[f"{stub}/acc/train"].compute() - expected_acc) < 1e-6
 
 
 # ---- update_kl_metrics -------------------------------------------------------

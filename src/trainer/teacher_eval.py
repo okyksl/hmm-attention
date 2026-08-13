@@ -3,7 +3,7 @@ from typing import Dict, List, Tuple
 import torch
 
 from src.loss import KLDivergenceLoss
-from src.teachers import ARTeacher
+from src.teachers import ARTeacher, MultiLevelHierarchicalTeacher
 
 
 class TeacherEvaluator:
@@ -19,6 +19,7 @@ class TeacherEvaluator:
     def __init__(self, teacher: torch.nn.Module, device: torch.device) -> None:
         self.teacher = teacher
         self.is_ar = isinstance(teacher, ARTeacher)
+        self.is_hierarchical = isinstance(teacher, MultiLevelHierarchicalTeacher)
         self._teacher_by_k: Dict[int, ARTeacher] = {}
         self.prefix_ks: List[int] = []
         # Lag-restricted variants only exist for teachers with an explicit
@@ -51,16 +52,44 @@ class TeacherEvaluator:
         return ["teacher"] + [f"teacher_k{k}" for k in self.prefix_ks]
 
     def loss_metric_keys(self) -> List[str]:
-        return [
+        keys = [
             f"{context}/loss/{split}"
             for context in self.context_names()
             for split in ("train", "val")
         ]
+        keys.extend(self._location_metric_keys("loss"))
+        return keys
 
     def acc_metric_keys(self) -> List[str]:
-        return [
+        keys = [
             f"{context}/acc/{split}"
             for context in self.context_names()
+            for split in ("train", "val")
+        ]
+        keys.extend(self._location_metric_keys("acc"))
+        return keys
+
+    def location_names(self) -> List[str]:
+        """Hierarchical surface locations, ordered top-to-bottom.
+
+        A surface prediction has one mixed-radix offset at every hierarchy
+        level. At level ``l``, offset ``s`` means that the prediction lies in
+        child ``s`` of the current level-``l`` unit. The same surface position
+        therefore contributes to one location metric per level.
+        """
+        if not self.is_hierarchical:
+            return []
+        return [
+            f"level{level}/offset{offset}"
+            for level, code in enumerate(self.teacher.levels)
+            for offset in range(code.size)
+        ]
+
+    def _location_metric_keys(self, metric: str) -> List[str]:
+        return [
+            f"{context}/{location}/{metric}/{split}"
+            for context in self.context_names()
+            for location in self.location_names()
             for split in ("train", "val")
         ]
 
@@ -101,6 +130,50 @@ class TeacherEvaluator:
         log_probs, targets = model.unroll(data, return_targets=True)
         out = log_probs.exp() if normalize else log_probs
         return out, log_probs, targets
+
+    def update_loss_acc_metrics(
+        self,
+        log_probs: torch.Tensor,
+        targets: torch.Tensor,
+        prefix: int,
+        split: str,
+        metrics: Dict[str, "LossMetric"],
+        loss_fn: torch.nn.Module,
+    ) -> None:
+        """Update aggregate and hierarchical-location teacher metrics.
+
+        Location metrics score the same surface predictions as the aggregate
+        metrics, partitioned by the prediction's within-unit offset at each
+        hierarchy level. Non-hierarchical teachers only update the aggregates.
+        """
+        context = self.context_name(prefix)
+        batch_size = targets.shape[0]
+        metrics[f"{context}/loss/{split}"].update(
+            loss_fn(log_probs, targets).item(), batch_size
+        )
+        metrics[f"{context}/acc/{split}"].update(log_probs, targets)
+
+        if not self.is_hierarchical:
+            return
+
+        positions = torch.arange(log_probs.shape[1], device=log_probs.device)
+        for level, code in enumerate(self.teacher.levels):
+            span = self.teacher._span[level]
+            child_span = self.teacher._span[level + 1]
+            offsets = (positions % span) // child_span
+            for offset in range(code.size):
+                mask = offsets == offset
+                if not bool(mask.any()):
+                    continue
+                stub = f"{context}/level{level}/offset{offset}"
+                location_log_probs = log_probs[:, mask, :]
+                location_targets = targets[:, mask, :]
+                metrics[f"{stub}/loss/{split}"].update(
+                    loss_fn(location_log_probs, location_targets).item(), batch_size
+                )
+                metrics[f"{stub}/acc/{split}"].update(
+                    location_log_probs, location_targets
+                )
 
     def update_kl_metrics(
         self,

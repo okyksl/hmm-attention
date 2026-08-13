@@ -9,7 +9,9 @@ import math
 
 import pytest
 import torch
+from torch.utils.data import DataLoader
 
+from src.data import ARDataset, ar_batch_collate
 from src.loss import CrossentropyLoss
 from src.trainer import LoggingConfig, NgramConfig, SchedulerConfig, SGDTrainer
 
@@ -63,6 +65,50 @@ def test_trainer_populates_constant_teacher_metrics(smoke_trainer):
     prefix_acc = smoke_trainer.metrics["teacher_k1/acc/train"].compute()
     assert math.isfinite(prefix_loss) and prefix_loss >= 0
     assert 0 <= prefix_acc <= 1
+
+
+def test_hierarchical_trainer_populates_per_level_offset_teacher_metrics(
+    tiny_hier_teacher, tiny_hier_predictor, tiny_student, device
+):
+    dataset = ARDataset(
+        predictor=tiny_hier_predictor,
+        window=tiny_hier_teacher.window,
+        dim=tiny_hier_teacher.dim,
+        number=4,
+        length=2 * tiny_hier_teacher.total,
+        prefix_length=tiny_hier_teacher.burn_in,
+        unroll_sequences=False,
+    )
+    loader = DataLoader(dataset, batch_size=2, collate_fn=ar_batch_collate)
+    optimizer = torch.optim.SGD(tiny_student.parameters(), lr=0.01)
+    scheduler = torch.optim.lr_scheduler.StepLR(
+        optimizer, step_size=10, gamma=1.0
+    )
+    trainer = SGDTrainer(
+        steps=1,
+        device=device,
+        teacher=tiny_hier_teacher,
+        student=tiny_student,
+        train_loader=loader,
+        val_loader=loader,
+        loss_fn=CrossentropyLoss(),
+        optimizer=optimizer,
+        scheduler_cfg=SchedulerConfig(scheduler=scheduler),
+        ngram_cfg=NgramConfig(steps=0),
+        logging_cfg=LoggingConfig(writer=None),
+    )
+
+    trainer._init_loop()
+    trainer._dry_loop()
+
+    for split in ("train", "val"):
+        for context in ("teacher", "teacher_k1", "teacher_k2"):
+            for offset in range(tiny_hier_teacher.levels[0].size):
+                stub = f"{context}/level0/offset{offset}"
+                loss = trainer.metrics[f"{stub}/loss/{split}"].compute()
+                acc = trainer.metrics[f"{stub}/acc/{split}"].compute()
+                assert math.isfinite(loss) and loss >= 0
+                assert 0 <= acc <= 1
 
 
 def test_trainer_does_not_register_redundant_true_loss(smoke_trainer):
