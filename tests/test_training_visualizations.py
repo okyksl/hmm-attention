@@ -12,8 +12,12 @@ from src.analysis.training_visualizations import (
     plot_attention_alignment,
     plot_attention_heatmaps,
     plot_probe_heatmap,
+    plot_probe_overview,
+    plot_probe_slice,
+    plot_probe_trajectory,
     probe_matrix_from_metrics,
     probe_layout_from_config,
+    probe_slice_from_metrics,
 )
 from src.visualizer import build_attention_table
 
@@ -61,6 +65,22 @@ def test_attention_plot_collections_recreate_current_figures():
         plt.close(figure)
 
 
+def test_dense_attention_heatmap_thins_tick_labels_and_keeps_endpoints():
+    attention = np.zeros((1, 30, 30), dtype=np.float32)
+
+    figures = plot_attention_heatmaps(attention, step=25)
+    axis = figures["average"].axes[0]
+    xlabels = [label.get_text() for label in axis.get_xticklabels()]
+    ylabels = [label.get_text() for label in axis.get_yticklabels()]
+
+    assert len(xlabels) == 10
+    assert len(ylabels) == 10
+    assert (xlabels[0], xlabels[-1]) == ("0", "29")
+    assert (ylabels[0], ylabels[-1]) == ("0", "29")
+    for figure in figures.values():
+        plt.close(figure)
+
+
 def test_probe_heatmap_reconstructs_scalar_grid():
     metrics = {
         f"probe/L{layer}/level0/slot{slot}/k-1/acc/val": layer + slot / 10
@@ -83,6 +103,92 @@ def test_probe_heatmap_reconstructs_scalar_grid():
     plt.close(figure)
 
 
+def test_probe_trajectory_shows_one_selected_metric():
+    prefix = "probe/L1/level0/slot1/k-1"
+    rows = {
+        0: {
+            f"{prefix}/acc/val": 0.25,
+            f"{prefix}/excess_nll/val": 1.2,
+        },
+        100: {
+            f"{prefix}/acc/val": 0.75,
+            f"{prefix}/excess_nll/val": 0.3,
+        },
+    }
+
+    accuracy = plot_probe_trajectory(rows, 1, 0, 1, -1)
+    excess_nll = plot_probe_trajectory(
+        rows, 1, 0, 1, -1, metric="excess_nll"
+    )
+
+    assert len(accuracy.axes) == 1
+    assert list(accuracy.axes[0].lines[0].get_xdata()) == [0, 100]
+    assert list(accuracy.axes[0].lines[0].get_ydata()) == [0.25, 0.75]
+    assert len(excess_nll.axes) == 1
+    assert list(excess_nll.axes[0].lines[0].get_ydata()) == [1.2, 0.3]
+    plt.close(accuracy)
+    plt.close(excess_nll)
+
+
+def test_planning_probe_trajectory_rejects_unavailable_excess_nll():
+    key = "probe/L0/level0/slot0/k+1/acc/val"
+    rows = {0: {key: 0.2}, 100: {key: 0.4}}
+
+    figure = plot_probe_trajectory(rows, 0, 0, 0, 1)
+
+    assert len(figure.axes) == 1
+    assert figure.axes[0].get_title().startswith("Accuracy —")
+    with pytest.raises(ValueError, match="no probe excess_nll values"):
+        plot_probe_trajectory(rows, 0, 0, 0, 1, metric="excess_nll")
+    plt.close(figure)
+
+
+def test_probe_slice_supports_arbitrary_axes_and_ragged_slots():
+    metrics = {
+        f"probe/L0/level{level}/slot{slot}/k0/acc/val": level + slot / 10
+        for level, slot_count in enumerate([2, 3])
+        for slot in range(slot_count)
+    }
+    coordinates = {"layer": 0, "level": 0, "slot": 0, "offset": 0}
+
+    matrix, x_labels, y_labels = probe_slice_from_metrics(
+        metrics, "level", "slot", coordinates, "acc", "val",
+        num_layers=2, slots_per_level=[2, 3], offsets=[-1, 0, 1],
+    )
+
+    assert matrix.shape == (3, 2)
+    assert np.isnan(matrix[2, 0])
+    assert matrix[2, 1] == pytest.approx(1.2)
+    assert x_labels == ["level0", "level1"]
+    assert y_labels == ["slot0", "slot1", "slot2"]
+    figure = plot_probe_slice(
+        metrics, 100, "level", "slot", coordinates, "acc", "val",
+        num_layers=2, slots_per_level=[2, 3], offsets=[-1, 0, 1],
+    )
+    assert figure.axes[0].get_xlabel() == "level"
+    assert figure.axes[0].get_ylabel() == "slot"
+    plt.close(figure)
+
+
+def test_probe_overview_facets_levels_and_offsets_in_one_figure():
+    metrics = {
+        f"probe/L{layer}/level{level}/slot{slot}/k{offset}/acc/val": 0.5
+        for layer in range(2)
+        for level, slot_count in enumerate([1, 2])
+        for slot in range(slot_count)
+        for offset in [-1, 0]
+    }
+
+    figure = plot_probe_overview(
+        metrics, 100, "acc", "val", num_layers=2,
+        slots_per_level=[1, 2], offsets=[-1, 0],
+    )
+
+    assert len(figure.axes) == 5  # four facets plus one shared colorbar
+    assert figure._suptitle.get_text() == "All probe accuracy at step 100"
+    plt.close(figure)
+
+
 def test_probe_layout_matches_resolved_multilevel_config():
     config = {
         "dataset": {"window": 3},
@@ -97,6 +203,24 @@ def test_probe_layout_matches_resolved_multilevel_config():
     layout = probe_layout_from_config(config)
 
     assert layout.num_layers == 3
+    assert layout.slots_per_level == [2, 3]
+    assert layout.offsets == [-3, -2, -1, 0, 1]
+
+
+def test_probe_layout_matches_parallel_chunk_size_config():
+    config = {
+        "dataset": {"window": 3},
+        "teacher": {
+            "base_teacher": {"span_lengths": [1, 1, 1], "stride": None},
+            "chunk_sizes": [2, 3],
+        },
+        "student": {"num_blocks": 3},
+        "misc": {"probe": {"offsets": None}},
+    }
+
+    layout = probe_layout_from_config(config)
+
+    assert layout.num_layers == 4
     assert layout.slots_per_level == [2, 3]
     assert layout.offsets == [-3, -2, -1, 0, 1]
 

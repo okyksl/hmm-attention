@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 
+from src.analysis.residual_phases import probe_metric_key
 from src.visualizer import compute_attention_alignment
 
 
@@ -25,7 +26,9 @@ def probe_layout_from_config(config: Mapping[str, Any]) -> ProbeLayout:
     """Infer the logger's probe layout from a resolved run configuration."""
     teacher = config["teacher"]
     student = config["student"]
-    if "levels" in teacher:
+    if "chunk_sizes" in teacher:
+        slots = [int(chunk_size) for chunk_size in teacher["chunk_sizes"]]
+    elif "levels" in teacher:
         slots = [int(level["chunk_size"]) for level in teacher["levels"]]
     elif "chunk_size" in teacher:
         slots = [int(teacher["chunk_size"])]
@@ -112,17 +115,47 @@ def _matrix_heatmap(
         cmap=cmap,
         vmin=vmin,
         vmax=vmax,
-        annot=True,
+        annot=matrix.size <= 100,
         fmt=".2f",
-        xticklabels=col_labels,
-        yticklabels=row_labels,
+        xticklabels=False,
+        yticklabels=False,
         linewidths=0.5,
     )
+    _set_readable_heatmap_ticks(ax, row_labels, col_labels)
     ax.set_title(title)
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
     fig.tight_layout()
     return fig
+
+
+def _tick_indices(size: int, max_ticks: int) -> np.ndarray:
+    """Return evenly spaced indices, preserving both endpoints."""
+    if size <= max_ticks:
+        return np.arange(size, dtype=int)
+    return np.unique(np.linspace(0, size - 1, max_ticks, dtype=int))
+
+
+def _set_readable_heatmap_ticks(
+    ax: plt.Axes,
+    row_labels: Sequence[str],
+    col_labels: Sequence[str],
+    max_ticks: int = 10,
+) -> None:
+    """Thin dense heatmap labels while retaining their cell-center alignment."""
+    row_indices = _tick_indices(len(row_labels), max_ticks)
+    col_indices = _tick_indices(len(col_labels), max_ticks)
+    ax.set_xticks(
+        col_indices + 0.5,
+        [col_labels[index] for index in col_indices],
+        rotation=45,
+        ha="right",
+    )
+    ax.set_yticks(
+        row_indices + 0.5,
+        [row_labels[index] for index in row_indices],
+        rotation=0,
+    )
 
 
 def plot_attention_heatmaps(
@@ -148,14 +181,14 @@ def plot_attention_heatmaps(
             vmin=0.0,
             vmax=1.0,
             cmap="Blues",
-            xticklabels=labels,
-            yticklabels=labels,
+            xticklabels=False,
+            yticklabels=False,
             cbar=True,
         )
+        _set_readable_heatmap_ticks(ax, labels, labels)
         ax.set_title(f"{label} ({split}, step {step})")
         ax.set_xlabel("Position")
         ax.set_ylabel("Position")
-        ax.tick_params(axis="x", rotation=45)
         fig.tight_layout()
         figures[key] = fig
     return figures
@@ -319,12 +352,17 @@ def plot_probe_heatmap(
         vmin=vmin,
         vmax=vmax,
         cmap=cmap,
-        annot=True,
+        annot=matrix.size <= 100,
         fmt=".2f",
-        xticklabels=[f"s{s}" for s in range(n_slots)],
-        yticklabels=[f"L{layer}" for layer in range(n_layers)],
+        xticklabels=False,
+        yticklabels=False,
         cbar=True,
         ax=ax,
+    )
+    _set_readable_heatmap_ticks(
+        ax,
+        [f"L{layer}" for layer in range(n_layers)],
+        [f"s{s}" for s in range(n_slots)],
     )
     ax.set_title(
         f"{label} — level{level}, {split}, k={offset:+d}, step {step}"
@@ -333,6 +371,281 @@ def plot_probe_heatmap(
     ax.set_ylabel("layer")
     fig.tight_layout()
     return fig
+
+
+def plot_probe_trajectory(
+    rows: Mapping[int, Mapping[str, Any]],
+    layer: int,
+    level: int,
+    slot: int,
+    offset: int,
+    metric: str = "acc",
+    split: str = "val",
+) -> plt.Figure:
+    """Plot one metric across all steps for a selected residual-stream probe."""
+    if metric not in {"acc", "excess_nll"}:
+        raise ValueError("metric must be 'acc' or 'excess_nll'")
+    key = probe_metric_key(layer, level, slot, offset, metric, split)
+    steps: List[int] = []
+    values: List[float] = []
+    for step, row in sorted(rows.items()):
+        value = row.get(key)
+        if value is None or pd.isna(value):
+            continue
+        steps.append(int(step))
+        values.append(float(value))
+
+    if not steps:
+        raise ValueError(
+            f"no probe {metric} values for "
+            f"L{layer}/level{level}/slot{slot}/k={offset:+d}"
+        )
+
+    color = "tab:blue" if metric == "acc" else "tab:orange"
+    fig, axis = plt.subplots(figsize=(7.2, 4.2))
+    axis.plot(
+        steps, values, marker="o", markersize=4, linewidth=2, color=color
+    )
+    if metric == "acc":
+        axis.set_ylabel("probe accuracy")
+        axis.set_ylim(-0.02, 1.02)
+        metric_label = "Accuracy"
+    else:
+        axis.axhline(0.0, color="0.4", linestyle="--", linewidth=1)
+        axis.set_ylabel("excess NLL (lower is better)")
+        metric_label = "Excess NLL"
+    axis.set_xlabel("training step")
+    axis.grid(alpha=0.25)
+    axis.spines[["top", "right"]].set_visible(False)
+    offset_label = f"k={offset:+d}" if offset else "k=0"
+    axis.set_title(
+        f"{metric_label} — L{layer}, level{level}, slot{slot}, {offset_label}"
+    )
+    fig.tight_layout()
+    return fig
+
+
+_PROBE_DIMENSIONS = ("layer", "level", "slot", "offset")
+
+
+def _probe_dimension_values(
+    dimension: str,
+    num_layers: int,
+    slots_per_level: Sequence[int],
+    offsets: Sequence[int],
+) -> List[int]:
+    if dimension == "layer":
+        return list(range(num_layers))
+    if dimension == "level":
+        return list(range(len(slots_per_level)))
+    if dimension == "slot":
+        return list(range(max(slots_per_level)))
+    if dimension == "offset":
+        return [int(offset) for offset in offsets]
+    raise ValueError(f"unknown probe dimension: {dimension!r}")
+
+
+def _probe_dimension_label(dimension: str, value: int) -> str:
+    if dimension == "layer":
+        return f"L{value}"
+    if dimension == "level":
+        return f"level{value}"
+    if dimension == "slot":
+        return f"slot{value}"
+    return f"k={value:+d}" if value else "k=0"
+
+
+def probe_slice_from_metrics(
+    metrics: Mapping[str, Any],
+    x_dimension: str,
+    y_dimension: str,
+    coordinates: Mapping[str, int],
+    metric: str,
+    split: str,
+    num_layers: int,
+    slots_per_level: Sequence[int],
+    offsets: Sequence[int],
+) -> tuple[np.ndarray, List[str], List[str]]:
+    """Build a 2-D probe slice while fixing the two remaining coordinates."""
+    if x_dimension == y_dimension:
+        raise ValueError("probe slice axes must be different")
+    if metric not in {"acc", "excess_nll"}:
+        raise ValueError("metric must be 'acc' or 'excess_nll'")
+    if not slots_per_level:
+        raise ValueError("probe slice requires at least one teacher level")
+
+    x_values = _probe_dimension_values(
+        x_dimension, num_layers, slots_per_level, offsets
+    )
+    y_values = _probe_dimension_values(
+        y_dimension, num_layers, slots_per_level, offsets
+    )
+    matrix = np.full((len(y_values), len(x_values)), np.nan, dtype=np.float32)
+
+    for y_index, y_value in enumerate(y_values):
+        for x_index, x_value in enumerate(x_values):
+            point = {dimension: int(coordinates[dimension])
+                     for dimension in _PROBE_DIMENSIONS}
+            point[x_dimension] = x_value
+            point[y_dimension] = y_value
+            level = point["level"]
+            slot = point["slot"]
+            if level < 0 or level >= len(slots_per_level):
+                continue
+            if slot < 0 or slot >= int(slots_per_level[level]):
+                continue
+            key = probe_metric_key(
+                point["layer"], level, slot, point["offset"], metric, split
+            )
+            value = metrics.get(key)
+            if value is not None and not pd.isna(value):
+                matrix[y_index, x_index] = float(value)
+
+    x_labels = [_probe_dimension_label(x_dimension, value) for value in x_values]
+    y_labels = [_probe_dimension_label(y_dimension, value) for value in y_values]
+    return matrix, x_labels, y_labels
+
+
+def _probe_color_scale(
+    metric: str,
+    values: Sequence[np.ndarray],
+) -> tuple[float, float, str, str]:
+    if metric == "acc":
+        return 0.0, 1.0, "viridis", "Accuracy"
+    if metric != "excess_nll":
+        raise ValueError("metric must be 'acc' or 'excess_nll'")
+    finite = [array[np.isfinite(array)] for array in values]
+    finite = [array for array in finite if array.size]
+    vmax = max((float(array.max()) for array in finite), default=1e-6)
+    return 0.0, max(vmax, 1e-6), "magma", "Excess NLL"
+
+
+def _draw_probe_matrix(
+    axis: plt.Axes,
+    matrix: np.ndarray,
+    x_labels: Sequence[str],
+    y_labels: Sequence[str],
+    vmin: float,
+    vmax: float,
+    cmap: str,
+) -> Any:
+    image = axis.imshow(
+        np.ma.masked_invalid(matrix), aspect="auto", interpolation="none",
+        vmin=vmin, vmax=vmax, cmap=cmap,
+    )
+    x_indices = _tick_indices(len(x_labels), 10)
+    y_indices = _tick_indices(len(y_labels), 10)
+    axis.set_xticks(
+        x_indices, [x_labels[index] for index in x_indices],
+        rotation=45, ha="right",
+    )
+    axis.set_yticks(y_indices, [y_labels[index] for index in y_indices])
+    if matrix.size <= 100:
+        for row, column in zip(*np.where(np.isfinite(matrix))):
+            axis.text(
+                column, row, f"{matrix[row, column]:.2f}",
+                ha="center", va="center", fontsize=8,
+            )
+    return image
+
+
+def plot_probe_slice(
+    metrics: Mapping[str, Any],
+    step: int,
+    x_dimension: str,
+    y_dimension: str,
+    coordinates: Mapping[str, int],
+    metric: str,
+    split: str,
+    num_layers: int,
+    slots_per_level: Sequence[int],
+    offsets: Sequence[int],
+) -> plt.Figure:
+    """Plot a selectable two-dimensional slice of one probe snapshot."""
+    matrix, x_labels, y_labels = probe_slice_from_metrics(
+        metrics, x_dimension, y_dimension, coordinates, metric, split,
+        num_layers, slots_per_level, offsets,
+    )
+    if np.isnan(matrix).all():
+        raise ValueError("this probe slice has no logged values")
+    vmin, vmax, cmap, metric_label = _probe_color_scale(metric, [matrix])
+    figure, axis = plt.subplots(
+        figsize=(max(5.0, 0.8 * len(x_labels) + 2.0),
+                 max(4.0, 0.6 * len(y_labels) + 1.8))
+    )
+    image = _draw_probe_matrix(
+        axis, matrix, x_labels, y_labels, vmin, vmax, cmap
+    )
+    fixed = [
+        _probe_dimension_label(dimension, int(coordinates[dimension]))
+        for dimension in _PROBE_DIMENSIONS
+        if dimension not in {x_dimension, y_dimension}
+    ]
+    axis.set_title(
+        f"{metric_label} at step {step} — " + ", ".join(fixed)
+    )
+    axis.set_xlabel(x_dimension)
+    axis.set_ylabel(y_dimension)
+    figure.colorbar(image, ax=axis, label=metric_label)
+    figure.tight_layout()
+    return figure
+
+
+def plot_probe_overview(
+    metrics: Mapping[str, Any],
+    step: int,
+    metric: str,
+    split: str,
+    num_layers: int,
+    slots_per_level: Sequence[int],
+    offsets: Sequence[int],
+) -> plt.Figure:
+    """Plot every layer/level/slot/offset value as a faceted snapshot."""
+    matrices = [
+        probe_matrix_from_metrics(
+            metrics, level, int(offset), metric, split,
+            num_layers, int(slots_per_level[level]),
+        )
+        for level in range(len(slots_per_level))
+        for offset in offsets
+    ]
+    if not matrices or all(np.isnan(matrix).all() for matrix in matrices):
+        raise ValueError("this probe overview has no logged values")
+    vmin, vmax, cmap, metric_label = _probe_color_scale(metric, matrices)
+    num_rows = len(slots_per_level)
+    num_columns = len(offsets)
+    figure, axes = plt.subplots(
+        num_rows, num_columns,
+        figsize=(max(5.0, 2.5 * num_columns), max(3.5, 2.3 * num_rows)),
+        squeeze=False, constrained_layout=True,
+    )
+    image = None
+    matrix_index = 0
+    for level in range(num_rows):
+        for column, offset in enumerate(offsets):
+            axis = axes[level, column]
+            matrix = matrices[matrix_index]
+            matrix_index += 1
+            x_labels = [f"slot{slot}" for slot in range(matrix.shape[1])]
+            y_labels = [f"L{layer}" for layer in range(matrix.shape[0])]
+            image = _draw_probe_matrix(
+                axis, matrix, x_labels, y_labels, vmin, vmax, cmap
+            )
+            axis.set_title(f"level{level}, k={int(offset):+d}", fontsize=10)
+            if level == num_rows - 1:
+                axis.set_xlabel("slot")
+            if column == 0:
+                axis.set_ylabel("layer")
+            if np.isnan(matrix).all():
+                axis.text(
+                    0.5, 0.5, "No values", transform=axis.transAxes,
+                    ha="center", va="center", color="0.4",
+                )
+    figure.suptitle(f"All probe {metric_label.lower()} at step {step}")
+    figure.colorbar(
+        image, ax=axes.ravel().tolist(), shrink=0.8, label=metric_label
+    )
+    return figure
 
 
 def save_figures(
