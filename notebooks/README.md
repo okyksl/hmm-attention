@@ -8,6 +8,7 @@ the fact — nothing in this folder is imported by training.
 | Path | Role |
 | --- | --- |
 | `head_phases.ipynb` | **The analysis notebook.** Fetch runs by tag, detect stage-wise head specialization, plot the trajectories. |
+| `residual_stream_phases.ipynb` | Depth-aware learning-order analysis: turn hierarchical residual probes into comparable acquisition events across student blocks and teacher levels. |
 | `post_training_visualizations.ipynb` | Recreate attention, alignment, value, and probe images from numerical W&B logs. |
 | `report_head_phases.py` | Same read-out as a one-shot CLI, for when you don't want a notebook. |
 | `utils.py` | W&B fetching (`fetch_runs`, `get_runs_data`) and shared plot styling. |
@@ -68,3 +69,12 @@ With `teacher.span_lengths=[1,1,1]` each span is a single position, so span `k`
 *is* offset `-(W-k)`. The notebook turns those series into a one-line story per
 run, e.g. `H3:-1@50 -> H2:-2@400 -> H1:-3@800`, and checks it against the order
 the run's own `lag_spectrum` config predicts.
+
+For multi-block students or multi-level teachers, use
+`residual_stream_phases.ipynb` instead. It does not try to assign semantics to
+individual attention heads. It asks when every `(teacher level, slot, offset)`
+target first becomes linearly decodable from residuals `L0..LN`, normalizing
+excess NLL from a uniform predictor to the logged teacher Bayes optimum before
+comparing levels. The notebook includes an offline depth-two demo and warns
+when co-trained SGD probes would confound representation emergence with probe
+optimizer lag.
