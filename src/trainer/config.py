@@ -59,15 +59,16 @@ class LoggingConfig:
     # common `[-base_teacher.context_length, ..., +1]` range.
     # `probe_sharing` selects whether slots share one linear readout or fit
     # independent readouts: "shared" | "per_slot".
-    # `probe_slot_mode` selects the reported phase resolution:
+    # `hierarchy_slot_mode` is shared by probes and teacher evaluation. It
+    # selects the reported within-unit phase resolution:
     #   "surface" — every surface-relative position within the target unit.
     #   "coarse"  — only the immediate-child slot (legacy behavior).
+    hierarchy_slot_mode: str = "surface"
     probe_mode: str = "off"
     probe_frequency: int = 100
     probe_offsets: Optional[Union[List[int], List[List[int]]]] = None
     probe_offset_mode: str = "auto"
     probe_sharing: str = "shared"
-    probe_slot_mode: str = "surface"
     probe_max_iters: int = 20
     probe_l2: float = 1e-3
     probe_lr: float = 1e-2

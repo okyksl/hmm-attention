@@ -44,6 +44,10 @@ checkpoint:
   # work" on resume — wandb drops those re-logs as non-monotonic. Prefer
   # bumping `log_frequency` over this knob if I/O becomes a real bottleneck.
   frequency: 1
+evaluation:
+  # Shared hierarchy location layout for teacher metrics and residual probes.
+  # surface: every surface-relative phase; coarse: immediate-child positions.
+  slot_mode: surface
 probe:
   mode: "off"              # off | warm_start | sgd
   frequency: 100
@@ -54,7 +58,6 @@ probe:
   offsets: null
   offset_mode: auto         # auto | legacy
   sharing: shared           # shared | per_slot
-  slot_mode: surface        # surface (full phase) | coarse (legacy child slot)
   max_iters: 20          # warm_start (LBFGS)
   l2: 1e-3               # warm_start (LBFGS)
   lr: 1e-2               # sgd (Adam)

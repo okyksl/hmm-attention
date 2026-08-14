@@ -227,10 +227,10 @@ def test_probe_layout_matches_resolved_multilevel_config():
         },
         "student": {"num_blocks": 2},
         "misc": {
+            "evaluation": {"slot_mode": "surface"},
             "probe": {
                 "offsets": None,
                 "offset_mode": "auto",
-                "slot_mode": "surface",
             }
         },
     }
@@ -254,7 +254,10 @@ def test_probe_layout_matches_parallel_chunk_size_config():
             "chunk_sizes": [2, 3],
         },
         "student": {"num_blocks": 3},
-        "misc": {"probe": {"offsets": None, "slot_mode": "surface"}},
+        "misc": {
+            "evaluation": {"slot_mode": "surface"},
+            "probe": {"offsets": None},
+        },
     }
 
     layout = probe_layout_from_config(config)

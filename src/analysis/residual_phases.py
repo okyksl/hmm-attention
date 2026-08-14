@@ -33,6 +33,7 @@ from typing import Any, List, Mapping, Optional, Sequence, Union
 import numpy as np
 import pandas as pd
 
+from src.hierarchy_slots import slot_mode_from_config
 from src.probe_offsets import (
     all_probe_offsets,
     normalize_offsets_by_level,
@@ -190,13 +191,13 @@ def probe_spec_from_config(config: Mapping[str, Any]) -> ProbeSpec:
             "teacher.levels, teacher.chunk_sizes, or teacher.chunk_size"
         )
 
-    slot_mode = probe.get("slot_mode", "coarse")
+    slot_mode = slot_mode_from_config(config)
     if slot_mode == "surface":
         slots = [prod(chunk_sizes[level:]) for level in range(len(chunk_sizes))]
     elif slot_mode == "coarse":
         slots = list(chunk_sizes)
     else:
-        raise ValueError("probe slot_mode must be 'surface' or 'coarse'")
+        raise ValueError("hierarchy slot_mode must be 'surface' or 'coarse'")
     # The terminal surface level has one token per unit and therefore one slot.
     slots.append(1)
 

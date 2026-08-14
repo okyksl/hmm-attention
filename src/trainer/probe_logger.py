@@ -26,13 +26,13 @@ Two fitting modes are supported:
     "warm_start" : LBFGS re-fit each eval step from previous weights.
     "sgd"        : Adam step per training step, measured at eval time.
 
-Slot fitting and reporting are independently configurable:
+Probe fitting and hierarchy-location reporting are independently configurable:
 
     sharing="shared"   : one probe per (student layer, teacher level, offset),
                          evaluated separately at every reported slot.
     sharing="per_slot" : an independent probe for every reported slot.
-    slot_mode="surface": slots are all surface-relative phases in the unit.
-    slot_mode="coarse" : slots are immediate-child positions (legacy mode).
+    evaluation.slot_mode="surface": slots are all surface-relative phases.
+    evaluation.slot_mode="coarse" : slots are immediate-child positions.
 
 See LoggingConfig.probe_* fields for cfg.
 """
@@ -46,6 +46,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from src.hierarchy_slots import (
+    hierarchy_slot_counts,
+    hierarchy_slot_ids,
+    validate_slot_mode,
+)
 from src.model import TransformerDecoder
 from src.probe_offsets import all_probe_offsets, resolve_probe_offsets
 from src.teachers import MultiLevelHierarchicalTeacher
@@ -53,7 +58,6 @@ from src.trainer.config import LoggingConfig
 
 VALID_MODES = ("off", "warm_start", "sgd")
 VALID_SHARING = ("shared", "per_slot")
-VALID_SLOT_MODES = ("surface", "coarse")
 
 # Probe identity: (layer, level, fitted slot or None when shared, offset).
 ProbeKey = Tuple[int, int, Optional[int], int]
@@ -99,7 +103,7 @@ class ProbeLogger:
         self.cfg = cfg
         self.mode = cfg.probe_mode
         self.sharing = cfg.probe_sharing
-        self.slot_mode = cfg.probe_slot_mode
+        self.slot_mode = cfg.hierarchy_slot_mode
         self.logger = logging.getLogger()
 
         if self.mode not in VALID_MODES:
@@ -111,11 +115,7 @@ class ProbeLogger:
                 f"probe_sharing must be one of {VALID_SHARING}; "
                 f"got {self.sharing!r}"
             )
-        if self.slot_mode not in VALID_SLOT_MODES:
-            raise ValueError(
-                f"probe_slot_mode must be one of {VALID_SLOT_MODES}; "
-                f"got {self.slot_mode!r}"
-            )
+        validate_slot_mode(self.slot_mode)
 
         self.enabled = (
             self.mode != "off"
@@ -135,11 +135,7 @@ class ProbeLogger:
         self.level_coarse_arity = [
             teacher.levels[l].size for l in range(self.num_latent_levels)
         ] + [1]
-        self.level_arity = (
-            self.level_spans[:-1]
-            if self.slot_mode == "surface"
-            else self.level_coarse_arity
-        )
+        self.level_arity = hierarchy_slot_counts(teacher, self.slot_mode)
         self.level_alphabet = [
             teacher.levels[l].in_dim for l in range(self.num_latent_levels)
         ] + [teacher.dim]
@@ -474,11 +470,9 @@ class ProbeLogger:
         t = torch.arange(T, device=residual.device)
         if slot is None:
             tsel = t
-        elif self.slot_mode == "surface":
-            tsel = t[t % span_l == slot]
         else:
-            span_child = self.level_spans[level + 1]
-            tsel = t[(t % span_l) // span_child == slot]
+            slot_ids = hierarchy_slot_ids(t, self.teacher, level, self.slot_mode)
+            tsel = t[slot_ids == slot]
         if tsel.numel() == 0:
             return None, None, None, None
         target_c = tsel // span_l + offset

@@ -2,6 +2,7 @@ from typing import Dict, List, Tuple
 
 import torch
 
+from src.hierarchy_slots import hierarchy_slot_counts, hierarchy_slot_ids
 from src.loss import KLDivergenceLoss
 from src.teachers import ARTeacher, MultiLevelHierarchicalTeacher
 
@@ -16,10 +17,21 @@ class TeacherEvaluator:
     the same number of output positions.
     """
 
-    def __init__(self, teacher: torch.nn.Module, device: torch.device) -> None:
+    def __init__(
+        self,
+        teacher: torch.nn.Module,
+        device: torch.device,
+        slot_mode: str = "surface",
+    ) -> None:
         self.teacher = teacher
         self.is_ar = isinstance(teacher, ARTeacher)
         self.is_hierarchical = isinstance(teacher, MultiLevelHierarchicalTeacher)
+        self.slot_mode = slot_mode
+        self.slot_counts = (
+            hierarchy_slot_counts(teacher, slot_mode)
+            if self.is_hierarchical
+            else []
+        )
         self._teacher_by_k: Dict[int, ARTeacher] = {}
         self.prefix_ks: List[int] = []
         # Lag-restricted variants only exist for teachers with an explicit
@@ -72,26 +84,37 @@ class TeacherEvaluator:
     def location_names(self) -> List[str]:
         """Hierarchical surface locations, ordered top-to-bottom.
 
-        A surface prediction has one mixed-radix offset at every hierarchy
-        level. At level ``l``, offset ``s`` means that the prediction lies in
-        child ``s`` of the current level-``l`` unit. The same surface position
-        therefore contributes to one location metric per level.
+        They use the same configured slot layout as the probe logger. The
+        terminal surface-token level is included with one slot, so the same
+        surface prediction contributes to one slot metric at every level of
+        the full generative path.
         """
         if not self.is_hierarchical:
             return []
         return [
-            f"level{level}/offset{offset}"
-            for level, code in enumerate(self.teacher.levels)
-            for offset in range(code.size)
+            f"level{level}/slot{slot}"
+            for level, count in enumerate(self.slot_counts)
+            for slot in range(count)
         ]
 
-    def _location_metric_keys(self, metric: str) -> List[str]:
+    def _location_metric_keys(
+        self,
+        metric: str,
+        contexts: List[str] | None = None,
+    ) -> List[str]:
+        contexts = self.context_names() if contexts is None else contexts
         return [
             f"{context}/{location}/{metric}/{split}"
-            for context in self.context_names()
+            for context in contexts
             for location in self.location_names()
             for split in ("train", "val")
         ]
+
+    def student_loss_metric_keys(self) -> List[str]:
+        return self._location_metric_keys("loss", contexts=["student"])
+
+    def student_acc_metric_keys(self) -> List[str]:
+        return self._location_metric_keys("acc", contexts=["student"])
 
     @staticmethod
     def context_name(prefix: int) -> str:
@@ -143,8 +166,8 @@ class TeacherEvaluator:
         """Update aggregate and hierarchical-location teacher metrics.
 
         Location metrics score the same surface predictions as the aggregate
-        metrics, partitioned by the prediction's within-unit offset at each
-        hierarchy level. Non-hierarchical teachers only update the aggregates.
+        metrics, partitioned by the configured slot layout at each hierarchy
+        level. Non-hierarchical teachers only update the aggregates.
         """
         context = self.context_name(prefix)
         batch_size = targets.shape[0]
@@ -153,26 +176,53 @@ class TeacherEvaluator:
         )
         metrics[f"{context}/acc/{split}"].update(log_probs, targets)
 
+        self.update_location_metrics(
+            out=log_probs,
+            targets=targets,
+            context=context,
+            split=split,
+            metrics=metrics,
+            loss_fn=loss_fn,
+        )
+
+    def update_location_metrics(
+        self,
+        out: torch.Tensor,
+        targets: torch.Tensor,
+        context: str,
+        split: str,
+        metrics: Dict[str, "LossMetric"],
+        loss_fn: torch.nn.Module,
+        position_offset: int = 0,
+    ) -> None:
+        """Update one model's loss/accuracy on every hierarchy location.
+
+        ``position_offset`` is the absolute surface index predicted by
+        ``out[:, 0]``. Teacher unrolls start at an aligned hierarchy boundary;
+        student outputs start at the dataset prefix length.
+        """
+
         if not self.is_hierarchical:
             return
 
-        positions = torch.arange(log_probs.shape[1], device=log_probs.device)
-        for level, code in enumerate(self.teacher.levels):
-            span = self.teacher._span[level]
-            child_span = self.teacher._span[level + 1]
-            offsets = (positions % span) // child_span
-            for offset in range(code.size):
-                mask = offsets == offset
+        batch_size = targets.shape[0]
+        positions = torch.arange(out.shape[1], device=out.device) + position_offset
+        for level, count in enumerate(self.slot_counts):
+            slots = hierarchy_slot_ids(
+                positions, self.teacher, level, self.slot_mode
+            )
+            for slot in range(count):
+                mask = slots == slot
                 if not bool(mask.any()):
                     continue
-                stub = f"{context}/level{level}/offset{offset}"
-                location_log_probs = log_probs[:, mask, :]
+                stub = f"{context}/level{level}/slot{slot}"
+                location_out = out[:, mask, :]
                 location_targets = targets[:, mask, :]
                 metrics[f"{stub}/loss/{split}"].update(
-                    loss_fn(location_log_probs, location_targets).item(), batch_size
+                    loss_fn(location_out, location_targets).item(), batch_size
                 )
                 metrics[f"{stub}/acc/{split}"].update(
-                    location_log_probs, location_targets
+                    location_out, location_targets
                 )
 
     def update_kl_metrics(

@@ -47,10 +47,12 @@ def test_non_hierarchical_teacher_has_no_location_metrics(tiny_teacher, device):
     ev = TeacherEvaluator(tiny_teacher, device=device)
     assert ev.location_names() == []
     assert not any("/level" in key for key in ev.loss_metric_keys())
-    assert not any("/offset" in key for key in ev.acc_metric_keys())
+    assert not any("/slot" in key for key in ev.acc_metric_keys())
 
 
-def test_multilevel_metric_keys_cover_each_level_offset(tiny_teacher, device):
+def test_multilevel_metric_keys_cover_full_surface_slots_and_terminal_level(
+    tiny_teacher, device
+):
     teacher = MultiLevelHierarchicalTeacher(
         base_teacher=tiny_teacher,
         levels=[
@@ -61,14 +63,42 @@ def test_multilevel_metric_keys_cover_each_level_offset(tiny_teacher, device):
     ev = TeacherEvaluator(teacher, device=device)
 
     assert ev.location_names() == [
-        "level0/offset0",
-        "level0/offset1",
-        "level1/offset0",
-        "level1/offset1",
-        "level1/offset2",
+        "level0/slot0",
+        "level0/slot1",
+        "level0/slot2",
+        "level0/slot3",
+        "level0/slot4",
+        "level0/slot5",
+        "level1/slot0",
+        "level1/slot1",
+        "level1/slot2",
+        "level2/slot0",
     ]
-    assert "teacher/level0/offset1/loss/train" in ev.loss_metric_keys()
-    assert "teacher_k1/level1/offset2/acc/val" in ev.acc_metric_keys()
+    assert "teacher/level0/slot5/loss/train" in ev.loss_metric_keys()
+    assert "teacher_k1/level1/slot2/acc/val" in ev.acc_metric_keys()
+    assert "teacher/level2/slot0/acc/val" in ev.acc_metric_keys()
+    assert "student/level0/slot5/loss/train" in ev.student_loss_metric_keys()
+    assert "student/level2/slot0/acc/val" in ev.student_acc_metric_keys()
+
+
+def test_multilevel_coarse_slots_match_probe_layout(tiny_teacher, device):
+    teacher = MultiLevelHierarchicalTeacher(
+        base_teacher=tiny_teacher,
+        levels=[
+            ChunkCode(in_dim=4, out_dim=3, size=2, chunk_seed=10),
+            ChunkCode(in_dim=3, out_dim=4, size=3, chunk_seed=11),
+        ],
+    )
+    ev = TeacherEvaluator(teacher, device=device, slot_mode="coarse")
+
+    assert ev.location_names() == [
+        "level0/slot0",
+        "level0/slot1",
+        "level1/slot0",
+        "level1/slot1",
+        "level1/slot2",
+        "level2/slot0",
+    ]
 
 
 # ---- _align_data -------------------------------------------------------------
@@ -133,19 +163,49 @@ def test_hierarchical_location_metrics_match_manual_masks(
         loss_fn=CrossentropyLoss(),
     )
 
-    for offset in range(tiny_hier_teacher.levels[0].size):
-        mask = torch.arange(log_probs.shape[1]) % tiny_hier_teacher.total == offset
-        expected_loss = F.cross_entropy(
-            log_probs[:, mask, :].reshape(-1, tiny_hier_teacher.dim),
-            targets[:, mask, :].reshape(-1, tiny_hier_teacher.dim),
-        ).item()
-        expected_acc = (
-            log_probs[:, mask, :].argmax(dim=-1)
-            == targets[:, mask, :].argmax(dim=-1)
-        ).float().mean().item()
-        stub = f"teacher/level0/offset{offset}"
-        assert abs(reg[f"{stub}/loss/train"].compute() - expected_loss) < 1e-6
-        assert abs(reg[f"{stub}/acc/train"].compute() - expected_acc) < 1e-6
+    positions = torch.arange(log_probs.shape[1])
+    for level, span in enumerate(tiny_hier_teacher._span):
+        for slot in range(span):
+            mask = positions % span == slot
+            expected_loss = F.cross_entropy(
+                log_probs[:, mask, :].reshape(-1, tiny_hier_teacher.dim),
+                targets[:, mask, :].reshape(-1, tiny_hier_teacher.dim),
+            ).item()
+            expected_acc = (
+                log_probs[:, mask, :].argmax(dim=-1)
+                == targets[:, mask, :].argmax(dim=-1)
+            ).float().mean().item()
+            stub = f"teacher/level{level}/slot{slot}"
+            assert abs(reg[f"{stub}/loss/train"].compute() - expected_loss) < 1e-6
+            assert abs(reg[f"{stub}/acc/train"].compute() - expected_acc) < 1e-6
+
+
+def test_student_location_metrics_honor_absolute_position_offset(
+    tiny_hier_teacher, device
+):
+    ev = TeacherEvaluator(tiny_hier_teacher, device=device)
+    reg = MetricRegistry()
+    for key in ev.student_loss_metric_keys():
+        reg.register(key, ConstantLossMetric())
+    for key in ev.student_acc_metric_keys():
+        reg.register(key, ConstantAccuracyMetric(k=1))
+
+    targets = F.one_hot(torch.tensor([[0, 1, 2]]), tiny_hier_teacher.dim).float()
+    logits = targets * 5.0
+    ev.update_location_metrics(
+        out=logits,
+        targets=targets,
+        context="student",
+        split="train",
+        metrics=reg,
+        loss_fn=CrossentropyLoss(),
+        position_offset=1,
+    )
+
+    # chunk_size=2 and the first prediction is absolute surface position 1,
+    # so level0 receives slots [1, 0, 1], not [0, 1, 0].
+    assert reg["student/level0/slot0/acc/train"].total == 1
+    assert reg["student/level0/slot1/acc/train"].total == 2
 
 
 # ---- update_kl_metrics -------------------------------------------------------

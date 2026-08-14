@@ -122,6 +122,103 @@ def _multilevel(sizes, dims, tuples, base_window=2, seed=0):
     return MultiLevelHierarchicalTeacher(base_teacher=base, levels=levels)
 
 
+def test_planning_beliefs_exact():
+    """next_base_log_probs + the downward cascade match brute-force enumeration."""
+    ml = _multilevel(sizes=[2, 3], dims=[5, 4, 7], tuples=[2, 2], base_window=2)
+    torch.manual_seed(0)
+    surf = ml.sample_surface_prefix((ml.base_teacher.burn_in + 5) * ml.total, batch_size=2)
+    base = ml.base_teacher
+    total, burn_in, w = ml.total, ml.burn_in, base.context_length
+
+    # (1) p_next == current-base posterior pushed through one base transition.
+    p_cur = ml.latent_beliefs(surf)[0]
+    p_next = ml.next_base_log_probs(surf)
+    base_hidden = ml._decode_levels(surf, stop_after=0)
+    B, n_pred, bd = p_cur.shape
+    for pos in range(0, n_pred, 3):
+        b_idx = (burn_in + pos) // total
+        prior = base_hidden[:, b_idx - w + 1 : b_idx, :]
+        exp = torch.zeros(B, bd)
+        for a in range(bd):
+            cand = torch.eye(bd)[a].view(1, 1, bd).expand(B, 1, bd)
+            nxt = base.next_token_log_probs(torch.cat([prior, cand], dim=1))
+            exp += p_cur[:, pos, :].exp()[:, a : a + 1] * nxt.exp()
+        assert (exp.clamp(min=1e-30).log() - p_next[:, pos, :]).abs().max() < 1e-4
+
+    # (2) downward cascade surface marginal == enumeration over (a, m0, m1).
+    pb = torch.randn(bd).log_softmax(0)
+    s1 = ml.levels[1].size
+    M0, M1 = ml.levels[0].num_tuples, ml.levels[1].num_tuples
+    tbl0, tbl1 = ml.levels[0]._chunk_slot_indices, ml.levels[1]._chunk_slot_indices
+    for local_pos in range(total):
+        slot0, slot1 = local_pos // s1, local_pos % s1
+        got = ml._downward_beliefs(pb.unsqueeze(0), local_pos)[-1].exp().squeeze(0)
+        enum = torch.zeros(ml.dim)
+        for a in range(bd):
+            for m0 in range(M0):
+                b = int(tbl0[a, m0, slot0])
+                for m1 in range(M1):
+                    enum[int(tbl1[b, m1, slot1])] += pb.exp()[a] / (M0 * M1)
+        assert (got - enum / enum.sum()).abs().max() < 1e-5
+
+    # (3) planning_beliefs: one entry per level (latent + surface), normalized,
+    # with U_l = total // span[l] units of the next base token.
+    plan = ml.planning_beliefs(surf)
+    assert len(plan) == ml.num_levels + 1
+    assert [x.shape[2] for x in plan] == [1, 2, 6]  # top / mid / surface
+    for x in plan:
+        sums = x.exp().sum(-1)
+        assert torch.allclose(sums, torch.ones_like(sums), atol=1e-4)
+
+
+def test_next_unit_beliefs_exact():
+    """Offset-+1 beliefs match brute force for both sibling and crossing cases."""
+    ml = _multilevel(sizes=[2, 3], dims=[5, 4, 7], tuples=[2, 2], base_window=2)
+    torch.manual_seed(0)
+    surf = ml.sample_surface_prefix((ml.base_teacher.burn_in + 4) * ml.total, batch_size=1)
+    total, burn_in = ml.total, ml.burn_in
+    s0, s1 = ml.levels[0].size, ml.levels[1].size
+    M0, M1 = ml.levels[0].num_tuples, ml.levels[1].num_tuples
+
+    nu = ml.next_unit_beliefs(surf)
+    assert torch.allclose(nu[0], ml.next_base_log_probs(surf), atol=1e-5)  # base +1 = p_next
+
+    base_lp = ml.base_teacher.unroll(ml._decode_levels(surf, stop_after=0))
+    p_next = ml.next_base_log_probs(surf)
+    tbl0, tbl1 = ml.levels[0]._chunk_slot_indices, ml.levels[1]._chunk_slot_indices
+    for j in range(nu[1].shape[1]):
+        i, lp = j // total, j % total
+        slot0, r1 = lp // s1, lp % s1
+        sb = surf[0, burn_in + i * total : burn_in + (i + 1) * total, :]
+        p_base = base_lp[0, i, :].exp()
+        obs_mid = [
+            int(ml.levels[1].decode(sb[jj * s1 : (jj + 1) * s1].unsqueeze(0)).argmax(-1))
+            for jj in range(slot0)
+        ]
+        obs_surf = [int(sb[slot0 * s1 + k].argmax()) for k in range(r1)]
+        belief = torch.zeros(ml.levels[1].in_dim)
+        if slot0 + 1 < s0:  # sibling within current base token
+            for a in range(ml.base_teacher.dim):
+                for m0 in range(M0):
+                    t0 = tbl0[a, m0]
+                    if any(int(t0[jj]) != obs_mid[jj] for jj in range(slot0)):
+                        continue
+                    cid = int(t0[slot0])
+                    beta = sum(
+                        1.0 / M1
+                        for m1 in range(M1)
+                        if all(int(tbl1[cid, m1, k]) == obs_surf[k] for k in range(r1))
+                    )
+                    belief[int(t0[slot0 + 1])] += p_base[a].item() / M0 * beta
+        else:  # crossing to the next base token's first unit
+            pnb = p_next[0, j, :].exp()
+            for a2 in range(ml.base_teacher.dim):
+                for m0 in range(M0):
+                    belief[int(tbl0[a2, m0, 0])] += pnb[a2].item() / M0
+        belief = belief / belief.sum().clamp(min=1e-30)
+        assert (nu[1][0, j].exp() - belief).abs().max() < 1e-5
+
+
 def test_decode_roundtrip():
     ml = _multilevel(sizes=[2, 3], dims=[6, 4, 8], tuples=[2, 2])
     torch.manual_seed(1)

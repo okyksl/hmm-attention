@@ -9,6 +9,7 @@ from src.model.decoder import TransformerDecoder
 from src.teachers import ChunkCode, LinearARTeacher, MultiLevelHierarchicalTeacher
 from src.trainer.config import LoggingConfig
 from src.trainer.probe_logger import ProbeLogger
+from src.trainer.teacher_eval import TeacherEvaluator
 
 
 def _make_teacher(k=(2, 3), dims=(6, 4, 8), tuples=(1, 1), base_window=2, seed=0):
@@ -66,6 +67,21 @@ def test_enabled_and_level_specs():
     ]
 
 
+@pytest.mark.parametrize(
+    ("slot_mode", "expected"),
+    [("surface", [6, 3, 1]), ("coarse", [2, 3, 1])],
+)
+def test_probe_and_teacher_eval_share_slot_layout(slot_mode, expected):
+    teacher = _make_teacher(k=(2, 3), dims=(6, 4, 8))
+    pl, _ = _logger(teacher, hierarchy_slot_mode=slot_mode)
+    teacher_eval = TeacherEvaluator(
+        teacher, device=torch.device("cpu"), slot_mode=slot_mode
+    )
+
+    assert pl.level_arity == expected
+    assert teacher_eval.slot_counts == expected
+
+
 def test_gather_level_digit_and_targets():
     teacher = _make_teacher(k=(2, 3))
     pl, _ = _logger(teacher)
@@ -119,7 +135,7 @@ def test_sharing_and_slot_modes_are_independent(
         mode="sgd",
         probe_offsets=[0],
         probe_sharing=sharing,
-        probe_slot_mode=slot_mode,
+        hierarchy_slot_mode=slot_mode,
     )
     data = teacher.sample_surface_prefix(4 * teacher.total, batch_size=3)
     residual = torch.randn(3, data.shape[1] - 1, 16)
@@ -250,7 +266,7 @@ def test_current_bayes_belief_uses_information_through_residual_position(
 def test_current_bayes_alignment_with_coarse_multilevel_slots():
     """A coarse slot can contain unfinished and boundary surface phases."""
     teacher = _make_teacher(k=(2, 3), dims=(6, 4, 8), base_window=2)
-    pl, _ = _logger(teacher, probe_slot_mode="coarse")
+    pl, _ = _logger(teacher, hierarchy_slot_mode="coarse")
     data = teacher.sample_surface_prefix(
         (teacher.base_teacher.burn_in + 3) * teacher.total, batch_size=2
     )

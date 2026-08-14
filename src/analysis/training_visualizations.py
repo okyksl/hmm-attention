@@ -11,6 +11,7 @@ import pandas as pd
 import seaborn as sns
 
 from src.analysis.residual_phases import probe_metric_key
+from src.hierarchy_slots import slot_mode_from_config
 from src.probe_offsets import (
     all_probe_offsets,
     normalize_offsets_by_level,
@@ -49,13 +50,13 @@ def probe_layout_from_config(config: Mapping[str, Any]) -> ProbeLayout:
     else:
         chunk_sizes = []
     probe = config.get("misc", {}).get("probe", {})
-    slot_mode = probe.get("slot_mode", "coarse")
+    slot_mode = slot_mode_from_config(config)
     if slot_mode == "surface":
         slots = [prod(chunk_sizes[level:]) for level in range(len(chunk_sizes))]
     elif slot_mode == "coarse":
         slots = list(chunk_sizes)
     else:
-        raise ValueError("probe slot_mode must be 'surface' or 'coarse'")
+        raise ValueError("hierarchy slot_mode must be 'surface' or 'coarse'")
     # Chunk-code levels describe transformations between node alphabets.  Probe
     # their input alphabets plus the terminal surface alphabet, whose units are
     # individual tokens and therefore have one slot.

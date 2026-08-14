@@ -301,6 +301,7 @@ def get_trainer(cfg: DictConfig) -> Optional[Trainer]:
         ),
     )
     probe_cfg = cfg.misc.get("probe", {})
+    evaluation_cfg = cfg.misc.get("evaluation", {})
     probe_offsets = probe_cfg.get("offsets", None)
     if probe_offsets is not None:
         probe_offsets = OmegaConf.to_container(probe_offsets, resolve=True)
@@ -308,12 +309,14 @@ def get_trainer(cfg: DictConfig) -> Optional[Trainer]:
         writer=writer,
         attention_frequency=cfg.misc.log_attention_frequency,
         log_frequency=cfg.misc.get("log_frequency", 1),
+        hierarchy_slot_mode=evaluation_cfg.get(
+            "slot_mode", probe_cfg.get("slot_mode", "surface")
+        ),
         probe_mode=probe_cfg.get("mode", "off"),
         probe_frequency=probe_cfg.get("frequency", 100),
         probe_offsets=probe_offsets,
         probe_offset_mode=probe_cfg.get("offset_mode", "auto"),
         probe_sharing=probe_cfg.get("sharing", "shared"),
-        probe_slot_mode=probe_cfg.get("slot_mode", "surface"),
         probe_max_iters=probe_cfg.get("max_iters", 20),
         probe_l2=probe_cfg.get("l2", 1e-3),
         probe_lr=probe_cfg.get("lr", 1e-2),

@@ -67,7 +67,7 @@ def test_trainer_populates_constant_teacher_metrics(smoke_trainer):
     assert 0 <= prefix_acc <= 1
 
 
-def test_hierarchical_trainer_populates_per_level_offset_teacher_metrics(
+def test_hierarchical_trainer_populates_per_level_slot_teacher_metrics(
     tiny_hier_teacher, tiny_hier_predictor, tiny_student, device
 ):
     dataset = ARDataset(
@@ -99,16 +99,29 @@ def test_hierarchical_trainer_populates_per_level_offset_teacher_metrics(
     )
 
     trainer._init_loop()
+    data = next(iter(loader)).to(device)
+    trainer._forward_and_metrics(
+        data, split="train", run_teacher_metrics=False
+    )
     trainer._dry_loop()
 
     for split in ("train", "val"):
         for context in ("teacher", "teacher_k1", "teacher_k2"):
-            for offset in range(tiny_hier_teacher.levels[0].size):
-                stub = f"{context}/level0/offset{offset}"
-                loss = trainer.metrics[f"{stub}/loss/{split}"].compute()
-                acc = trainer.metrics[f"{stub}/acc/{split}"].compute()
-                assert math.isfinite(loss) and loss >= 0
-                assert 0 <= acc <= 1
+            for level, span in enumerate(tiny_hier_teacher._span):
+                for slot in range(span):
+                    stub = f"{context}/level{level}/slot{slot}"
+                    loss = trainer.metrics[f"{stub}/loss/{split}"].compute()
+                    acc = trainer.metrics[f"{stub}/acc/{split}"].compute()
+                    assert math.isfinite(loss) and loss >= 0
+                    assert 0 <= acc <= 1
+
+    for level, span in enumerate(tiny_hier_teacher._span):
+        for slot in range(span):
+            stub = f"student/level{level}/slot{slot}"
+            loss = trainer.metrics[f"{stub}/loss/train"].compute()
+            acc = trainer.metrics[f"{stub}/acc/train"].compute()
+            assert math.isfinite(loss) and loss >= 0
+            assert 0 <= acc <= 1
 
 
 def test_trainer_does_not_register_redundant_true_loss(smoke_trainer):

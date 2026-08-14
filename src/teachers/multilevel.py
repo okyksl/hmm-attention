@@ -3,6 +3,7 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from src.teachers.base import ADAPTIVE, ARTeacher
 from src.teachers.chunk_code import ChunkCode
@@ -239,7 +240,8 @@ class MultiLevelHierarchicalTeacher(ARTeacher):
         p_base: torch.Tensor,
         base_surface: torch.Tensor,
         local_pos: int,
-    ) -> List[torch.Tensor]:
+        p_next: Optional[torch.Tensor] = None,
+    ):
         """Bayes-optimal belief over the *current* latent at every level.
 
         Exact posterior over each level-`l` unit covering `local_pos` given the
@@ -300,7 +302,39 @@ class MultiLevelHierarchicalTeacher(ARTeacher):
             post = alphas[l].exp() * betas[l]
             post = post / post.sum(dim=-1, keepdim=True).clamp(min=1e-30)
             beliefs.append(post.clamp(min=1e-30).log())
-        return beliefs
+        if p_next is None:
+            return beliefs
+
+        # Offset +1 ("next unit") belief per level: increment the mixed-radix
+        # position. A sibling (next child of the same parent) is read from that
+        # parent's joint (x, m) posterior — α_parent · compat(completed siblings)
+        # · β(current child) — which conditions on the partially-observed current
+        # unit (else the ceiling is beatable). A carry (current unit is the last
+        # child) crosses to child 0 of the parent's own next unit; the base level
+        # crosses to the next base token `p_next`.
+        next_beliefs: List[torch.Tensor] = [p_next]
+        for l in range(1, self.num_levels):
+            parent = self.levels[l - 1]
+            s = slots[l - 1]
+            if s + 1 < parent.size:
+                alpha_p = alphas[l - 1].exp()  # (..., in_dim_p)
+                compat_p = parent._compat_mask(observeds[l - 1], s)  # (..., in_dim_p, M)
+                cur_child = parent._chunk_slot_indices[:, :, s]  # (in_dim_p, M)
+                beta_cur = betas[l][..., cur_child]  # (..., in_dim_p, M)
+                joint = alpha_p.unsqueeze(-1) * compat_p * beta_cur
+                joint = joint / joint.sum(dim=(-1, -2), keepdim=True).clamp(min=1e-30)
+                sib = parent._chunk_slot_indices[:, :, s + 1]  # (in_dim_p, M) -> in_dim[l]
+                sib_oh = F.one_hot(sib, self.levels[l].in_dim).to(joint.dtype)
+                nu = torch.einsum("...xm,xml->...l", joint, sib_oh)
+                next_beliefs.append(nu.clamp(min=1e-30).log())
+            else:  # carry: child 0 of the parent's next unit (unobserved)
+                zeros = torch.zeros(
+                    *lead, parent.size, dtype=torch.long, device=base_surface.device
+                )
+                next_beliefs.append(
+                    parent.next_slot_logprobs(next_beliefs[l - 1], zeros, 0, 0)
+                )
+        return beliefs, next_beliefs
 
     def latent_beliefs(self, sequence: torch.Tensor) -> List[torch.Tensor]:
         """Per-level Bayes belief over the current unit at each predicted position.
@@ -343,6 +377,44 @@ class MultiLevelHierarchicalTeacher(ARTeacher):
             )
         return out
 
+    def next_unit_beliefs(self, sequence: torch.Tensor) -> List[torch.Tensor]:
+        """Per-level Bayes belief over the *next* unit (offset +1) at each position.
+
+        Mirrors `latent_beliefs` (same shapes/alignment) but for the unit one step
+        ahead at each level — the sibling within the current base token, or, at a
+        boundary, the first unit of the next base token (bottoming out in the next
+        top-level latent `p_next`). Returns a length-L list, entry `l` shape
+        (B, L_surf - burn_in, in_dim[l]) log-probs. The Bayes ceiling for offset +1.
+        """
+        B, L_surf, D = sequence.shape
+        base_hidden = self._decode_levels(sequence, stop_after=0)
+        base_log_probs = self.base_teacher.unroll(base_hidden)  # (B, n_base_out, base_dim)
+        n_base_out = base_log_probs.shape[1]
+        pred_surface = sequence[:, self.burn_in :, :].reshape(B, n_base_out, self.total, D)
+        p_base_flat = base_log_probs.reshape(B * n_base_out, -1)
+        pred_surface_flat = pred_surface.reshape(B * n_base_out, self.total, D)
+
+        base_dim = self.base_teacher.dim
+        p_next = self.next_base_log_probs(sequence).reshape(
+            B, n_base_out, self.total, base_dim
+        )
+
+        per_level: List[List[torch.Tensor]] = [[] for _ in range(self.num_levels)]
+        for local_pos in range(self.total):
+            p_next_lp = p_next[:, :, local_pos, :].reshape(B * n_base_out, base_dim)
+            _, nb = self._fold_beliefs(
+                p_base_flat, pred_surface_flat, local_pos, p_next=p_next_lp
+            )
+            for l in range(self.num_levels):
+                per_level[l].append(nb[l])
+
+        return [
+            torch.stack(per_level[l], dim=1).reshape(
+                B, n_base_out * self.total, self.levels[l].in_dim
+            )
+            for l in range(self.num_levels)
+        ]
+
     def _base_next_log_probs(self, base_hidden: torch.Tensor) -> torch.Tensor:
         """Next base-token log-probs from a decoded base context, honoring the
         base teacher's memory regime (whole prefix if adaptive, else the trailing
@@ -352,6 +424,113 @@ class MultiLevelHierarchicalTeacher(ARTeacher):
             if base_hidden.shape[-2] > ctx:
                 base_hidden = base_hidden[..., -ctx:, :]
         return self.base_teacher.next_token_log_probs(base_hidden)
+
+    # --- planning: beliefs about the *next* top-level latent and its subtree ---
+    def _downward_beliefs(
+        self, p_base: torch.Tensor, local_pos: int
+    ) -> List[torch.Tensor]:
+        """Pure downward cascade of a base-token distribution to an UNOBSERVED
+        subtree: the marginal over each node's id at surface offset `local_pos`,
+        given only `p_base` (no surface evidence).
+
+        Returns a length-(num_levels + 1) list — one per latent level plus the
+        terminal surface token — entry `l` shape (..., in_dim[l]) (surface entry
+        (..., dim)) log-probs. This is the same cascade `_fold_beliefs` runs, with
+        every level's observation count forced to 0 (so `compat` is all-ones and
+        the upward pass is trivial).
+        """
+        lead = p_base.shape[:-1]
+        p = p_base
+        c = 0
+        out: List[torch.Tensor] = []
+        for l in range(self.num_levels):
+            span_child = self._span[l + 1]
+            slot_l = (local_pos - c) // span_child
+            out.append(p)  # marginal over this level's unit (no evidence)
+            observed = torch.zeros(
+                *lead, self.levels[l].size, dtype=torch.long, device=p_base.device
+            )
+            p = self.levels[l].next_slot_logprobs(p, observed, 0, slot_l)
+            c += slot_l * span_child
+        out.append(p)  # terminal surface token at local_pos
+        return out
+
+    def next_base_log_probs(self, sequence: torch.Tensor) -> torch.Tensor:
+        """Belief over the *next* base token at every predicted position.
+
+        `p_next = Σ_a P(base_cur = a | prefix) · base.next([ctx, a])` — the current
+        base-token posterior (`latent_beliefs`, level 0) pushed through one base
+        transition, marginalizing the still-uncertain current token. Returns
+        (B, L_surf - burn_in, base.dim) log-probs. This is the single forward step
+        beyond which planning would require integrating over a future base token.
+        """
+        B, L_surf, D = sequence.shape
+        base_hidden = self._decode_levels(sequence, stop_after=0)  # (B, L_h, base_dim)
+        L_h = base_hidden.shape[1]
+        base_dim = self.base_teacher.dim
+        base_burn = self.base_teacher.burn_in
+        n_base_out = L_h - base_burn
+
+        p_cur = self.latent_beliefs(sequence)[0]  # (B, n_pred, base_dim) log-probs
+        n_pred = p_cur.shape[1]
+        eye = torch.eye(base_dim, device=sequence.device, dtype=sequence.dtype)
+
+        # Per predicted base token i (base index base_burn + i), M[i][a, b'] =
+        # log P(next = b' | realized prior context, current = a).
+        mats: List[torch.Tensor] = []
+        for i in range(n_base_out):
+            b_idx = base_burn + i
+            if self.base_teacher.is_adaptive:
+                prior = base_hidden[:, :b_idx, :]
+            else:
+                w = self.base_teacher.context_length
+                prior = base_hidden[:, b_idx - w + 1 : b_idx, :]  # (B, w-1, base_dim)
+            plen = prior.shape[1]
+            prior_e = prior.unsqueeze(1).expand(B, base_dim, plen, base_dim)
+            cand = eye.view(1, base_dim, 1, base_dim).expand(B, base_dim, 1, base_dim)
+            ctx = torch.cat([prior_e, cand], dim=2).reshape(B * base_dim, plen + 1, base_dim)
+            m = self.base_teacher.next_token_log_probs(ctx).reshape(B, base_dim, base_dim)
+            mats.append(m)
+        M = torch.stack(mats, dim=1)  # (B, n_base_out, a, next)
+
+        j = torch.arange(n_pred, device=sequence.device)
+        i_of_pos = (self.burn_in + j) // self.total - base_burn  # (n_pred,)
+        M_pos = M[:, i_of_pos, :, :]  # (B, n_pred, a, next)
+        # logsumexp_a( p_cur[a] + M[a, next] )
+        return torch.logsumexp(p_cur.unsqueeze(-1) + M_pos, dim=2)
+
+    def planning_beliefs(self, sequence: torch.Tensor) -> List[torch.Tensor]:
+        """Bayes belief over every unit of the *next* base token's subtree.
+
+        Cascades `next_base_log_probs` down through the chunk tables (unobserved),
+        giving, per level `l` (latent levels then the terminal surface), the
+        belief over each of that level's `U_l = total // span[l]` units in the next
+        base token. Returns a length-(num_levels + 1) list, entry `l` shape
+        (B, L_surf - burn_in, U_l, alphabet_l) log-probs. These are the Bayes
+        ceilings for planning offsets whose target lands in the next base token.
+        """
+        p_next = self.next_base_log_probs(sequence)  # (B, n_pred, base_dim)
+        B, n_pred, base_dim = p_next.shape
+        flat = p_next.reshape(B * n_pred, base_dim)
+
+        per_pos: List[List[torch.Tensor]] = [[] for _ in range(self.num_levels + 1)]
+        for local_pos in range(self.total):
+            bel = self._downward_beliefs(flat, local_pos)
+            for l in range(self.num_levels + 1):
+                per_pos[l].append(bel[l])
+
+        alphabets = [lv.in_dim for lv in self.levels] + [self.dim]
+        out: List[torch.Tensor] = []
+        for l in range(self.num_levels + 1):
+            stacked = torch.stack(per_pos[l], dim=1).reshape(
+                B, n_pred, self.total, alphabets[l]
+            )
+            span_l = self._span[l] if l < self.num_levels else 1
+            unit_starts = torch.arange(
+                self.total // span_l, device=sequence.device
+            ) * span_l
+            out.append(stacked[:, :, unit_starts, :])  # (B, n_pred, U_l, alphabet)
+        return out
 
     # --- ARTeacher methods ---
     def next_token_log_probs(self, context: torch.Tensor) -> torch.Tensor:

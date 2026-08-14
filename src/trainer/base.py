@@ -183,6 +183,15 @@ class Trainer(ABC):
 
         self.metrics[f"student/loss/{split}"].update(loss.item(), data.size(0))
         self.metrics[f"student/acc/{split}"].update(out, target)
+        self.teacher_eval.update_location_metrics(
+            out=out,
+            targets=target,
+            context="student",
+            split=split,
+            metrics=self.metrics,
+            loss_fn=self.loss_fn,
+            position_offset=self.train_loader.dataset.prefix_length,
+        )
 
         if run_teacher_metrics and isinstance(self.teacher, ARTeacher):
             with prof.cuda(f"teacher_kl_{split}"):
@@ -198,7 +207,11 @@ class Trainer(ABC):
         self.teacher = self.teacher.to(self.device)
         self.student = self.student.to(self.device)
 
-        self.teacher_eval = TeacherEvaluator(self.teacher, self.device)
+        self.teacher_eval = TeacherEvaluator(
+            self.teacher,
+            self.device,
+            slot_mode=self.logging_cfg.hierarchy_slot_mode,
+        )
         # When the ngram training phase is disabled, skip ngram construction
         # entirely — otherwise ngram KL runs on every log step even though the
         # ngram models are never trained or trainable.
@@ -242,6 +255,13 @@ class Trainer(ABC):
         ):
             self.history[key] = []
             self.metrics.register(key, metric)
+
+        self._register_metrics(
+            self.teacher_eval.student_loss_metric_keys(), LossMetric
+        )
+        self._register_metrics(
+            self.teacher_eval.student_acc_metric_keys(), AccuracyMetric, k=1
+        )
 
         if isinstance(self.teacher, ARTeacher):
             self._register_metrics(self.teacher_eval.metric_keys(), LossMetric)

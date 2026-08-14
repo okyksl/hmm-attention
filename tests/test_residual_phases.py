@@ -36,10 +36,10 @@ def _config():
         },
         "student": {"num_blocks": 3},
         "misc": {
+            "evaluation": {"slot_mode": "surface"},
             "probe": {
                 "offsets": None,
                 "offset_mode": "auto",
-                "slot_mode": "surface",
             }
         },
         "dataset": {"window": 2},
@@ -67,7 +67,10 @@ def test_probe_spec_from_single_level_hierarchical_config():
             "base_teacher": {"dim": 11, "burn_in": 3},
         },
         "student": {"num_blocks": 1},
-        "misc": {"probe": {"offsets": [-1, 0], "slot_mode": "surface"}},
+        "misc": {
+            "evaluation": {"slot_mode": "surface"},
+            "probe": {"offsets": [-1, 0]},
+        },
     }
     assert probe_spec_from_config(config) == ProbeSpec(
         num_layers=2,
@@ -88,7 +91,8 @@ def test_probe_spec_from_parallel_multilevel_config_includes_surface():
         "student": {"num_blocks": 1},
         "dataset": {"dim": 9},
         "misc": {
-            "probe": {"offsets": [-1, 0, 1], "slot_mode": "surface"}
+            "evaluation": {"slot_mode": "surface"},
+            "probe": {"offsets": [-1, 0, 1]},
         },
     }
 
@@ -103,12 +107,20 @@ def test_probe_spec_from_parallel_multilevel_config_includes_surface():
 
 def test_probe_spec_retains_coarse_slot_mode():
     config = _config()
-    config["misc"]["probe"]["slot_mode"] = "coarse"
+    config["misc"]["evaluation"]["slot_mode"] = "coarse"
 
     spec = probe_spec_from_config(config)
 
     assert spec.slots_per_level == [2, 3, 1]
     assert spec.level_spans == [6, 3, 1]
+
+
+def test_probe_spec_reads_legacy_probe_scoped_slot_mode():
+    config = _config()
+    config["misc"].pop("evaluation")
+    config["misc"]["probe"]["slot_mode"] = "coarse"
+
+    assert probe_spec_from_config(config).slots_per_level == [2, 3, 1]
 
 
 def test_probe_keys_match_logger_schema():
