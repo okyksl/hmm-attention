@@ -1,11 +1,13 @@
 """Hidden-state belief probe for MultiLevelHierarchicalTeacher + TransformerDecoder.
 
-At every surface position there is a whole *open path* of latents — one unit per
-level of the teacher's chunk hierarchy. For each residual position `t` (post any
-transformer layer) and each level `l`, this fits a linear probe that decodes the
-true level-`l` unit id of chunk `c_l(t) + k`, where `c_l(t) = t // span[l]`, the
-within-unit slot is the mixed-radix digit `s_l = (t mod span[l]) // span[l+1]`,
-and `k` is a configurable offset (in level-`l` units). Three regimes emerge:
+At every surface position there is a whole generative path — one unit per
+latent level plus the terminal surface token. For each residual position `t`
+(post any transformer layer) and each probe level `l`, this fits a linear probe
+that decodes the true level-`l` unit id of chunk `c_l(t) + k`, where
+`c_l(t) = t // span[l]`, the within-unit slot is the mixed-radix digit
+`s_l = (t mod span[l]) // span[l+1]`, and `k` is a configurable offset (in
+level-`l` units). The terminal surface level has span 1 and a single slot.
+Three regimes emerge:
 
     k <  0 : retention        (target unit complete, Bayes = 100%)
     k == 0 : belief refinement (sharpens with within-unit slot)
@@ -13,13 +15,22 @@ and `k` is a configurable offset (in level-`l` units). Three regimes emerge:
 
 Each probe is also compared against the teacher's Bayes-optimal belief
 (`latent_beliefs`): `bayes_acc`, `bayes_nll`, and the `excess_nll` the student
-has yet to close. `HierarchicalTeacher` is the `L=1` case and flows through the
-same path (a single `level0`).
+has yet to close. The surface level uses the observed one-hot token as its
+offset-0 Bayes ceiling. `HierarchicalTeacher` is the one-code-level case and
+therefore logs `level0` for the base Markov state and `level1` for the surface.
 
 Two fitting modes are supported:
 
     "warm_start" : LBFGS re-fit each eval step from previous weights.
     "sgd"        : Adam step per training step, measured at eval time.
+
+Slot fitting and reporting are independently configurable:
+
+    sharing="shared"   : one probe per (student layer, teacher level, offset),
+                         evaluated separately at every reported slot.
+    sharing="per_slot" : an independent probe for every reported slot.
+    slot_mode="surface": slots are all surface-relative phases in the unit.
+    slot_mode="coarse" : slots are immediate-child positions (legacy mode).
 
 See LoggingConfig.probe_* fields for cfg.
 """
@@ -38,9 +49,11 @@ from src.teachers import MultiLevelHierarchicalTeacher
 from src.trainer.config import LoggingConfig
 
 VALID_MODES = ("off", "warm_start", "sgd")
+VALID_SHARING = ("shared", "per_slot")
+VALID_SLOT_MODES = ("surface", "coarse")
 
-# Probe identity: (layer, level, slot, offset).
-ProbeKey = Tuple[int, int, int, int]
+# Probe identity: (layer, level, fitted slot or None when shared, offset).
+ProbeKey = Tuple[int, int, Optional[int], int]
 
 
 class ProbeLogger:
@@ -82,11 +95,23 @@ class ProbeLogger:
         self.student = student
         self.cfg = cfg
         self.mode = cfg.probe_mode
+        self.sharing = cfg.probe_sharing
+        self.slot_mode = cfg.probe_slot_mode
         self.logger = logging.getLogger()
 
         if self.mode not in VALID_MODES:
             raise ValueError(
                 f"probe_mode must be one of {VALID_MODES}; got {self.mode!r}"
+            )
+        if self.sharing not in VALID_SHARING:
+            raise ValueError(
+                f"probe_sharing must be one of {VALID_SHARING}; "
+                f"got {self.sharing!r}"
+            )
+        if self.slot_mode not in VALID_SLOT_MODES:
+            raise ValueError(
+                f"probe_slot_mode must be one of {VALID_SLOT_MODES}; "
+                f"got {self.slot_mode!r}"
             )
 
         self.enabled = (
@@ -107,13 +132,24 @@ class ProbeLogger:
         else:
             self.offsets = list(cfg.probe_offsets)
 
-        # One latent per level: the open path from surface up to the base.
-        # `span[l]` surface tokens per level-`l` unit; slot = mixed-radix digit;
-        # classes = that level's input alphabet.
-        self.num_levels = teacher.num_levels
-        self.level_spans = list(teacher._span)  # length num_levels + 1
-        self.level_arity = [teacher.levels[l].size for l in range(self.num_levels)]
-        self.level_alphabet = [teacher.levels[l].in_dim for l in range(self.num_levels)]
+        # Probe every node alphabet in the generative path: the input alphabet
+        # of each chunk-code level, followed by its terminal surface output.
+        # The synthetic child span on the terminal level keeps the usual
+        # mixed-radix gather rule valid: span=1, child span=1, hence slot=0.
+        self.num_latent_levels = teacher.num_levels
+        self.num_levels = self.num_latent_levels + 1
+        self.level_spans = [*teacher._span, 1]
+        self.level_coarse_arity = [
+            teacher.levels[l].size for l in range(self.num_latent_levels)
+        ] + [1]
+        self.level_arity = (
+            self.level_spans[:-1]
+            if self.slot_mode == "surface"
+            else self.level_coarse_arity
+        )
+        self.level_alphabet = [
+            teacher.levels[l].in_dim for l in range(self.num_latent_levels)
+        ] + [teacher.dim]
         self.burn_in = teacher.burn_in
         self.num_blocks = student.num_blocks
 
@@ -202,15 +238,20 @@ class ProbeLogger:
                 continue
             for level in range(self.num_levels):
                 labels = labels_per_level[level]
-                for slot in range(self.level_arity[level]):
+                fitted_slots = (
+                    [None]
+                    if self.sharing == "shared"
+                    else list(range(self.level_arity[level]))
+                )
+                for fitted_slot in fitted_slots:
                     for offset in self.offsets:
                         X, y, _, _ = self._gather_level(
-                            residual, labels, None, level, slot, offset
+                            residual, labels, None, level, fitted_slot, offset
                         )
                         if X is None or X.shape[0] == 0:
                             continue
                         probe, opt = self._ensure_probe(
-                            layer_idx, slot, offset, X.shape[-1], X.device,
+                            layer_idx, fitted_slot, offset, X.shape[-1], X.device,
                             need_opt=True, level=level,
                         )
                         opt.zero_grad()
@@ -239,59 +280,59 @@ class ProbeLogger:
             return
 
         data = torch.cat(self._val_data, dim=0)  # (N, L, dim)
-        beliefs = self.teacher.latent_beliefs(data)  # per level (N, L-burn_in, C)
+        beliefs = list(self.teacher.latent_beliefs(data))
+        # The current observed surface token is known exactly. Keeping this as
+        # a belief tensor makes levelD/k0 use the same Bayes metric path as all
+        # latent levels (and correctly exposes its deliberately trivial ceiling).
+        surface_belief = data[:, self.burn_in :, :].clamp(min=1e-30).log()
+        beliefs.append(surface_belief)
         labels_per_level = [self._decode_level(data, l) for l in range(self.num_levels)]
         residuals = {
             i: torch.cat(rs, dim=0) for i, rs in self._val_residuals.items() if rs
         }
-        train_frac = self.cfg.probe_train_frac
-
         metrics: Dict[str, float] = {}
         for layer_idx, R in residuals.items():
             for level in range(self.num_levels):
                 labels = labels_per_level[level]
-                for slot in range(self.level_arity[level]):
-                    for offset in self.offsets:
+                for offset in self.offsets:
+                    if self.sharing == "shared":
+                        X_all, y_all, _, _ = self._gather_level(
+                            R, labels, None, level, None, offset
+                        )
+                        if X_all is None or X_all.shape[0] < 2:
+                            continue
+                        X_train, _, y_train, _, _ = self._split_rows(X_all, y_all)
+                        probe, _ = self._ensure_probe(
+                            layer_idx, None, offset, X_all.shape[-1], X_all.device,
+                            need_opt=False, level=level,
+                        )
+                        if self.mode == "warm_start":
+                            self._lbfgs_fit(probe, X_train, y_train)
+
+                    for slot in range(self.level_arity[level]):
                         X, y, belief, bvalid = self._gather_level(
                             R, labels, beliefs[level], level, slot, offset
                         )
                         if X is None or X.shape[0] < 2:
                             continue
 
-                        n_train = max(1, int(X.shape[0] * train_frac))
-                        X_train, X_eval = X[:n_train], X[n_train:]
-                        y_train, y_eval = y[:n_train], y[n_train:]
-                        if X_eval.shape[0] == 0:
-                            X_eval, y_eval = X_train, y_train
-                            eval_slice = slice(0, n_train)
-                        else:
-                            eval_slice = slice(n_train, X.shape[0])
+                        if self.sharing == "per_slot":
+                            X_train, _, y_train, _, _ = self._split_rows(X, y)
+                            probe, _ = self._ensure_probe(
+                                layer_idx, slot, offset, X.shape[-1], X.device,
+                                need_opt=False, level=level,
+                            )
+                            if self.mode == "warm_start":
+                                self._lbfgs_fit(probe, X_train, y_train)
 
-                        probe, _ = self._ensure_probe(
-                            layer_idx, slot, offset, X.shape[-1], X.device,
-                            need_opt=False, level=level,
+                        values = self._evaluate_probe(
+                            probe, X, y, belief, bvalid, offset
                         )
-                        if self.mode == "warm_start":
-                            self._lbfgs_fit(probe, X_train, y_train)
-
-                        with torch.no_grad():
-                            logits = probe(X_eval)
-                            nll = F.cross_entropy(logits, y_eval).item()
-                            acc = (logits.argmax(dim=-1) == y_eval).float().mean().item()
 
                         offset_name = _offset_name(offset)
                         stub = f"probe/L{layer_idx}/level{level}/slot{slot}/{offset_name}"
-                        metrics[f"{stub}/acc/{split}"] = acc
-                        metrics[f"{stub}/nll/{split}"] = nll
-                        metrics[f"{stub}/n/{split}"] = X_eval.shape[0]
-                        bayes = self._bayes_ceiling(
-                            offset, belief, bvalid, eval_slice, logits, y_eval
-                        )
-                        if bayes is not None:
-                            bayes_acc, bayes_nll, excess = bayes
-                            metrics[f"{stub}/bayes_acc/{split}"] = bayes_acc
-                            metrics[f"{stub}/bayes_nll/{split}"] = bayes_nll
-                            metrics[f"{stub}/excess_nll/{split}"] = excess
+                        for metric, value in values.items():
+                            metrics[f"{stub}/{metric}/{split}"] = value
 
         self.writer.log(metrics, step=step)
         self._clear_val_buffers()
@@ -300,6 +341,50 @@ class ProbeLogger:
     def _clear_val_buffers(self) -> None:
         self._val_residuals = {i: [] for i in range(self.num_layers)}
         self._val_data = []
+
+    def _split_rows(
+        self,
+        X: torch.Tensor,
+        y: torch.Tensor,
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        slice,
+    ]:
+        """Apply the configured train/eval split to flattened probe rows."""
+        n_train = max(1, int(X.shape[0] * self.cfg.probe_train_frac))
+        X_train, X_eval = X[:n_train], X[n_train:]
+        y_train, y_eval = y[:n_train], y[n_train:]
+        if X_eval.shape[0] == 0:
+            return X_train, X_train, y_train, y_train, slice(0, n_train)
+        return X_train, X_eval, y_train, y_eval, slice(n_train, X.shape[0])
+
+    def _evaluate_probe(
+        self,
+        probe: nn.Linear,
+        X: torch.Tensor,
+        y: torch.Tensor,
+        belief: Optional[torch.Tensor],
+        belief_valid: Optional[torch.Tensor],
+        offset: int,
+    ) -> Dict[str, float]:
+        """Evaluate one fitted readout on one reported slot."""
+        _, X_eval, _, y_eval, eval_slice = self._split_rows(X, y)
+        with torch.no_grad():
+            logits = probe(X_eval)
+            values = {
+                "acc": (logits.argmax(dim=-1) == y_eval).float().mean().item(),
+                "nll": F.cross_entropy(logits, y_eval).item(),
+                "n": int(X_eval.shape[0]),
+            }
+        bayes = self._bayes_ceiling(
+            offset, belief, belief_valid, eval_slice, logits, y_eval
+        )
+        if bayes is not None:
+            values["bayes_acc"], values["bayes_nll"], values["excess_nll"] = bayes
+        return values
 
     def _decode_level(self, data: torch.Tensor, level: int) -> torch.Tensor:
         """Decode the level-`level` unit id covering each span. (N, L_level)."""
@@ -310,7 +395,7 @@ class ProbeLogger:
     def _ensure_probe(
         self,
         layer: int,
-        slot: int,
+        slot: Optional[int],
         offset: int,
         in_dim: int,
         device: torch.device,
@@ -336,7 +421,7 @@ class ProbeLogger:
         labels: torch.Tensor,  # (N, L_level)
         belief_level: Optional[torch.Tensor],  # (N, L - burn_in, C) or None
         level: int,
-        slot: int,
+        slot: Optional[int],
         offset: int,
     ) -> Tuple[
         Optional[torch.Tensor],
@@ -344,8 +429,11 @@ class ProbeLogger:
         Optional[torch.Tensor],
         Optional[torch.Tensor],
     ]:
-        """Extract flat (X, y) pairs at positions whose mixed-radix digit at
-        `level` equals `slot`, targeting unit `c_l(t) + offset`.
+        """Extract flat pairs for one reported slot, or every slot if ``None``.
+
+        In surface mode, slot is ``t % span[level]``. In coarse mode, it is the
+        legacy mixed-radix immediate-child digit. The target is always unit
+        ``c_l(t) + offset``.
 
         Returns (X, y, belief, belief_valid). For offset 0, `belief` holds the
         Bayes-optimal log-belief over the current unit at each row (with
@@ -354,10 +442,15 @@ class ProbeLogger:
         N, T, D = residual.shape
         L_level = labels.shape[1]
         span_l = self.level_spans[level]
-        span_child = self.level_spans[level + 1]
 
         t = torch.arange(T, device=residual.device)
-        tsel = t[(t % span_l) // span_child == slot]
+        if slot is None:
+            tsel = t
+        elif self.slot_mode == "surface":
+            tsel = t[t % span_l == slot]
+        else:
+            span_child = self.level_spans[level + 1]
+            tsel = t[(t % span_l) // span_child == slot]
         if tsel.numel() == 0:
             return None, None, None, None
         target_c = tsel // span_l + offset

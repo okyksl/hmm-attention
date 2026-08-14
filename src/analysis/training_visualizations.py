@@ -1,6 +1,7 @@
 """Pure post-training plots for numerical attention and probe snapshots."""
 
 from dataclasses import dataclass
+from math import prod
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
@@ -27,15 +28,27 @@ def probe_layout_from_config(config: Mapping[str, Any]) -> ProbeLayout:
     teacher = config["teacher"]
     student = config["student"]
     if "chunk_sizes" in teacher:
-        slots = [int(chunk_size) for chunk_size in teacher["chunk_sizes"]]
+        chunk_sizes = [int(size) for size in teacher["chunk_sizes"]]
     elif "levels" in teacher:
-        slots = [int(level["chunk_size"]) for level in teacher["levels"]]
+        chunk_sizes = [int(level["chunk_size"]) for level in teacher["levels"]]
     elif "chunk_size" in teacher:
-        slots = [int(teacher["chunk_size"])]
+        chunk_sizes = [int(teacher["chunk_size"])]
     else:
-        slots = []
-
+        chunk_sizes = []
     probe = config.get("misc", {}).get("probe", {})
+    slot_mode = probe.get("slot_mode", "coarse")
+    if slot_mode == "surface":
+        slots = [prod(chunk_sizes[level:]) for level in range(len(chunk_sizes))]
+    elif slot_mode == "coarse":
+        slots = list(chunk_sizes)
+    else:
+        raise ValueError("probe slot_mode must be 'surface' or 'coarse'")
+    # Chunk-code levels describe transformations between node alphabets.  Probe
+    # their input alphabets plus the terminal surface alphabet, whose units are
+    # individual tokens and therefore have one slot.
+    if slots:
+        slots.append(1)
+
     configured_offsets = probe.get("offsets")
     if configured_offsets is not None:
         offsets = [int(offset) for offset in configured_offsets]

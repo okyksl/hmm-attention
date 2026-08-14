@@ -40,9 +40,10 @@ checkpoint:
 probe:
   mode: "off"              # off | warm_start | sgd
   frequency: 100
-  offsets: null          # null → derive from teacher (base_teacher.context_length)
+  offsets: null             # null → derive from teacher (base_teacher.context_length)
+  sharing: shared           # shared | per_slot
+  slot_mode: surface        # surface (full phase) | coarse (legacy child slot)
   max_iters: 20          # warm_start (LBFGS)
   l2: 1e-3               # warm_start (LBFGS)
   lr: 1e-2               # sgd (Adam)
   train_frac: 0.8        # within-val split: fit vs. eval
-

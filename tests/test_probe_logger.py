@@ -80,6 +80,22 @@ def test_offsets_default_from_teacher():
     assert pl.offsets == [-3, -2, -1, 0, 1]
 
 
+def test_single_code_level_also_probes_terminal_surface_level():
+    teacher = _make_teacher(hidden_dim=6, chunk_dim=8, chunk_size=2)
+    student = _make_student(dim=teacher.chunk_dim, hidden_dim=16)
+    cfg = LoggingConfig(writer=None, probe_mode="warm_start")
+
+    pl = ProbeLogger(writer=None, teacher=teacher, student=student, cfg=cfg)
+
+    assert pl.num_latent_levels == 1
+    assert pl.num_levels == 2
+    assert pl.level_arity == [2, 1]
+    assert pl.level_alphabet == [6, 8]
+    assert pl.level_spans == [2, 1, 1]
+    data = _sample_data(teacher, batch=2, num_chunks=4)
+    assert torch.equal(pl._decode_level(data, 1), data.argmax(dim=-1))
+
+
 def test_offset_metric_names_are_unambiguous():
     assert _offset_name(-3) == "k-3"
     assert _offset_name(-1) == "k-1"
@@ -178,9 +194,11 @@ def test_sgd_step_improves_over_random_init():
     pl._current_residuals = tuple([(0, residual), (1, residual), (2, residual)])
     pl._current_data = data
 
-    # Baseline: random-init probe accuracy at (layer=1, level=0, slot=1, offset=0).
+    # Baseline: the default shared probe, evaluated at level0/slot1/k0.
     X, y, _, _ = pl._gather_level(residual, labels, None, level=0, slot=1, offset=0)
-    probe, _ = pl._ensure_probe(1, 1, 0, X.shape[-1], X.device, need_opt=True, level=0)
+    probe, _ = pl._ensure_probe(
+        1, None, 0, X.shape[-1], X.device, need_opt=True, level=0
+    )
     with torch.no_grad():
         acc0 = (probe(X).argmax(dim=-1) == y).float().mean().item()
 

@@ -275,6 +275,8 @@ def get_trainer(cfg: DictConfig) -> Optional[Trainer]:
         probe_mode=probe_cfg.get("mode", "off"),
         probe_frequency=probe_cfg.get("frequency", 100),
         probe_offsets=probe_offsets,
+        probe_sharing=probe_cfg.get("sharing", "shared"),
+        probe_slot_mode=probe_cfg.get("slot_mode", "surface"),
         probe_max_iters=probe_cfg.get("max_iters", 20),
         probe_l2=probe_cfg.get("l2", 1e-3),
         probe_lr=probe_cfg.get("lr", 1e-2),

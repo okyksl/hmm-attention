@@ -53,9 +53,16 @@ class LoggingConfig:
     #                  high-frequency probing.
     # `probe_offsets=None` → derive `[-base_teacher.context_length, ..., +1]`
     # from the teacher at first-use (adaptive to the AR window).
+    # `probe_sharing` selects whether slots share one linear readout or fit
+    # independent readouts: "shared" | "per_slot".
+    # `probe_slot_mode` selects the reported phase resolution:
+    #   "surface" — every surface-relative position within the target unit.
+    #   "coarse"  — only the immediate-child slot (legacy behavior).
     probe_mode: str = "off"
     probe_frequency: int = 100
     probe_offsets: Optional[List[int]] = None
+    probe_sharing: str = "shared"
+    probe_slot_mode: str = "surface"
     probe_max_iters: int = 20
     probe_l2: float = 1e-3
     probe_lr: float = 1e-2
