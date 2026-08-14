@@ -159,6 +159,131 @@ def test_bayes_ceiling_retention_and_refinement():
     assert pl._bayes_ceiling(1, None, None, slice(0, 4), logits, y) is None
 
 
+@pytest.mark.parametrize(
+    ("level", "slot", "completes_unit"),
+    [
+        (0, 2, False),  # top latent, still inside its six-surface-token unit
+        (0, 5, True),   # top latent boundary
+        (1, 1, False),  # intermediate latent, still inside its three-token unit
+        (1, 2, True),   # intermediate latent boundary
+        (2, 0, True),   # observed terminal surface token
+    ],
+)
+def test_current_bayes_belief_uses_information_through_residual_position(
+    level, slot, completes_unit
+):
+    """k0 predicts the unit covering t from a residual that has consumed x_t.
+
+    At unfinished units this is the teacher's pre-token posterior at t+1. At
+    each level boundary it must instead be a delta on the just-completed unit;
+    the posterior at t+1 would refer to a different unit there.
+    """
+    teacher = _make_teacher(k=(2, 3), dims=(6, 4, 8), base_window=2)
+    pl, _ = _logger(teacher)
+    data = teacher.sample_surface_prefix(
+        (teacher.base_teacher.burn_in + 3) * teacher.total, batch_size=2
+    )
+    residual = torch.randn(2, data.shape[1] - 1, 5)
+    labels = pl._decode_level(data, level)
+    pre_token_belief = (
+        teacher.latent_beliefs(data)[level]
+        if level < teacher.num_levels
+        else None
+    )
+
+    _, y, belief, belief_valid = pl._gather_level(
+        residual, labels, pre_token_belief, level, slot, offset=0
+    )
+
+    span = pl.level_spans[level]
+    t = torch.arange(residual.shape[1])
+    tsel = t[t % span == slot]
+    b = belief.reshape(data.shape[0], tsel.numel(), -1)
+    bv = belief_valid.reshape(data.shape[0], tsel.numel())
+    y_grid = y.reshape(data.shape[0], tsel.numel())
+
+    if completes_unit:
+        assert bool(bv.all())
+        assert torch.equal(b.argmax(dim=-1), y_grid)
+        assert torch.allclose(
+            b.exp(), F.one_hot(y_grid, b.shape[-1]).float(), atol=1e-6
+        )
+    else:
+        next_idx = tsel + 1 - teacher.burn_in
+        expected_valid = (next_idx >= 0) & (next_idx < pre_token_belief.shape[1])
+        assert torch.equal(bv[0], expected_valid)
+        assert torch.equal(bv, expected_valid.expand_as(bv))
+        assert torch.allclose(
+            b[:, expected_valid, :],
+            pre_token_belief[:, next_idx[expected_valid], :],
+        )
+
+
+def test_current_bayes_alignment_with_coarse_multilevel_slots():
+    """A coarse slot can contain unfinished and boundary surface phases."""
+    teacher = _make_teacher(k=(2, 3), dims=(6, 4, 8), base_window=2)
+    pl, _ = _logger(teacher, probe_slot_mode="coarse")
+    data = teacher.sample_surface_prefix(
+        (teacher.base_teacher.burn_in + 3) * teacher.total, batch_size=2
+    )
+    residual = torch.randn(2, data.shape[1] - 1, 5)
+    level = 0
+    slot = 1
+    labels = pl._decode_level(data, level)
+    pre_token_belief = teacher.latent_beliefs(data)[level]
+
+    _, y, belief, belief_valid = pl._gather_level(
+        residual, labels, pre_token_belief, level, slot, offset=0
+    )
+
+    span = pl.level_spans[level]
+    child_span = pl.level_spans[level + 1]
+    t = torch.arange(residual.shape[1])
+    tsel = t[(t % span) // child_span == slot]
+    complete = tsel % span == span - 1
+    next_idx = tsel + 1 - teacher.burn_in
+    expected_valid = ((next_idx >= 0) & (next_idx < pre_token_belief.shape[1])) | complete
+    b = belief.reshape(data.shape[0], tsel.numel(), -1)
+    bv = belief_valid.reshape(data.shape[0], tsel.numel())
+    y_grid = y.reshape(data.shape[0], tsel.numel())
+
+    assert torch.equal(bv, expected_valid.expand_as(bv))
+    assert torch.allclose(
+        b[:, ~complete & expected_valid, :],
+        pre_token_belief[:, next_idx[~complete & expected_valid], :],
+    )
+    assert torch.equal(b[:, complete, :].argmax(dim=-1), y_grid[:, complete])
+
+
+def test_probe_and_bayes_metrics_use_identical_valid_eval_rows():
+    teacher = _make_teacher()
+    pl, _ = _logger(teacher, probe_train_frac=0.5)
+    num_classes = pl.level_alphabet[0]
+    probe = torch.nn.Linear(3, num_classes)
+    with torch.no_grad():
+        probe.weight.zero_()
+        probe.bias.zero_()
+        probe.bias[0] = 1.0  # always predict class 0
+
+    X = torch.zeros(6, 3)
+    # Eval rows are [3, 4, 5]. Row 3 would be correct, but has no Bayes belief;
+    # the two comparable rows are both deliberately incorrect for the probe.
+    y = torch.tensor([0, 0, 0, 0, 1, 1])
+    belief = F.one_hot(y, num_classes).float().clamp(min=1e-30).log()
+    belief_valid = torch.tensor([True, True, True, False, True, True])
+
+    values = pl._evaluate_probe(
+        probe, X, y, belief, belief_valid, offset=0
+    )
+
+    assert values["n"] == 2
+    assert values["acc"] == 0.0
+    assert values["bayes_acc"] == 1.0
+    assert values["excess_nll"] == pytest.approx(
+        values["nll"] - values["bayes_nll"]
+    )
+
+
 def test_probe_recovers_current_unit_per_level():
     """Residuals = one-hot(true current-unit id) -> the probe decodes it (offset 0)."""
     torch.manual_seed(0)

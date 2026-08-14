@@ -13,11 +13,13 @@ Three regimes emerge:
     k == 0 : belief refinement (sharpens with within-unit slot)
     k == +1: planning/lookahead
 
-Each probe is also compared against the teacher's Bayes-optimal belief
-(`latent_beliefs`): `bayes_acc`, `bayes_nll`, and the `excess_nll` the student
-has yet to close. The surface level uses the observed one-hot token as its
-offset-0 Bayes ceiling. `HierarchicalTeacher` is the one-code-level case and
-therefore logs `level0` for the base Markov state and `level1` for the surface.
+Each probe is also compared against the teacher's Bayes-optimal belief given
+the same information as the residual: surface tokens through and including its
+position. The resulting `bayes_acc`, `bayes_nll`, and `excess_nll` use exactly
+the same held-out rows as `acc` and `nll`. The surface level uses the observed
+one-hot token as its offset-0 Bayes ceiling. `HierarchicalTeacher` is the
+one-code-level case and therefore logs `level0` for the base Markov state and
+`level1` for the surface.
 
 Two fitting modes are supported:
 
@@ -280,12 +282,13 @@ class ProbeLogger:
             return
 
         data = torch.cat(self._val_data, dim=0)  # (N, L, dim)
-        beliefs = list(self.teacher.latent_beliefs(data))
-        # The current observed surface token is known exactly. Keeping this as
-        # a belief tensor makes levelD/k0 use the same Bayes metric path as all
-        # latent levels (and correctly exposes its deliberately trivial ceiling).
-        surface_belief = data[:, self.burn_in :, :].clamp(min=1e-30).log()
-        beliefs.append(surface_belief)
+        beliefs: List[Optional[torch.Tensor]] = list(
+            self.teacher.latent_beliefs(data)
+        )
+        # The terminal surface target is the token already consumed at the
+        # residual position. `_gather_level` constructs its delta posterior
+        # directly, so no extra (potentially large) belief tensor is needed.
+        beliefs.append(None)
         labels_per_level = [self._decode_level(data, l) for l in range(self.num_levels)]
         residuals = {
             i: torch.cat(rs, dim=0) for i, rs in self._val_residuals.items() if rs
@@ -370,14 +373,33 @@ class ProbeLogger:
         belief_valid: Optional[torch.Tensor],
         offset: int,
     ) -> Dict[str, float]:
-        """Evaluate one fitted readout on one reported slot."""
+        """Evaluate one fitted readout on one reported slot.
+
+        Whenever a Bayes posterior is available, the ordinary probe metrics
+        are restricted to that posterior's valid rows as well. This makes
+        ``acc`` versus ``bayes_acc`` and ``nll`` versus ``bayes_nll`` direct
+        comparisons rather than statistics over different samples.
+        """
         _, X_eval, _, y_eval, eval_slice = self._split_rows(X, y)
         with torch.no_grad():
             logits = probe(X_eval)
+            metric_mask = torch.ones(
+                y_eval.shape[0], dtype=torch.bool, device=y_eval.device
+            )
+            if offset == 0 and belief is not None:
+                if belief_valid is None:
+                    raise ValueError("offset-0 beliefs require a validity mask")
+                metric_mask = belief_valid[eval_slice]
+                if not bool(metric_mask.any()):
+                    return {}
+            comparable_logits = logits[metric_mask]
+            comparable_y = y_eval[metric_mask]
             values = {
-                "acc": (logits.argmax(dim=-1) == y_eval).float().mean().item(),
-                "nll": F.cross_entropy(logits, y_eval).item(),
-                "n": int(X_eval.shape[0]),
+                "acc": (
+                    comparable_logits.argmax(dim=-1) == comparable_y
+                ).float().mean().item(),
+                "nll": F.cross_entropy(comparable_logits, comparable_y).item(),
+                "n": int(metric_mask.sum().item()),
             }
         bayes = self._bayes_ceiling(
             offset, belief, belief_valid, eval_slice, logits, y_eval
@@ -419,7 +441,7 @@ class ProbeLogger:
         self,
         residual: torch.Tensor,  # (N, T, D)
         labels: torch.Tensor,  # (N, L_level)
-        belief_level: Optional[torch.Tensor],  # (N, L - burn_in, C) or None
+        belief_level: Optional[torch.Tensor],  # pre-token beliefs or None
         level: int,
         slot: Optional[int],
         offset: int,
@@ -435,9 +457,15 @@ class ProbeLogger:
         legacy mixed-radix immediate-child digit. The target is always unit
         ``c_l(t) + offset``.
 
-        Returns (X, y, belief, belief_valid). For offset 0, `belief` holds the
-        Bayes-optimal log-belief over the current unit at each row (with
-        `belief_valid` masking rows before burn-in); otherwise both are None.
+        Returns (X, y, belief, belief_valid). For offset 0, `belief` is the
+        Bayes-optimal log-posterior over the current unit after observing the
+        surface token at the residual position. `teacher.latent_beliefs` is a
+        pre-token posterior, so an unfinished unit uses its entry at ``t+1``.
+        If position ``t`` completes the unit, its observed chunk decodes the
+        unit exactly and the posterior is a delta on `y`; this boundary rule is
+        essential at every depth because ``t+1`` belongs to a different unit.
+        `belief_valid` masks only unfinished pre-burn-in units for which the
+        teacher does not define a prior. For nonzero offsets both are None.
         """
         N, T, D = residual.shape
         L_level = labels.shape[1]
@@ -464,11 +492,40 @@ class ProbeLogger:
         y = labels[:, target_c].reshape(-1)
 
         belief = belief_valid = None
-        if offset == 0 and belief_level is not None:
-            idx = tsel - self.burn_in
-            vb = idx >= 0
-            b = belief_level[:, idx.clamp(min=0), :]  # (N, P, C)
-            belief = b.reshape(-1, b.shape[-1])
+        is_surface = level == self.num_levels - 1
+        if offset == 0 and (belief_level is not None or is_surface):
+            num_classes = self.level_alphabet[level]
+            # A residual at t has consumed x_t. For an unfinished level unit,
+            # the pre-token belief at t+1 is therefore the matching posterior.
+            next_idx = tsel + 1 - self.burn_in
+            unfinished_valid = torch.zeros_like(next_idx, dtype=torch.bool)
+            belief_template = belief_level if belief_level is not None else residual
+            b = belief_template.new_zeros((N, tsel.numel(), num_classes))
+            if belief_level is not None:
+                unfinished_valid = (next_idx >= 0) & (
+                    next_idx < belief_level.shape[1]
+                )
+                if bool(unfinished_valid.any()):
+                    b[:, unfinished_valid, :] = belief_level[
+                        :, next_idx[unfinished_valid], :
+                    ]
+
+            # At the last surface phase, all observations belonging to the
+            # current unit are available and the globally-decodable chunk code
+            # identifies its latent exactly. This also covers every terminal
+            # surface token (span 1) without reading a future unit's belief.
+            complete = tsel % span_l == span_l - 1
+            if bool(complete.any()):
+                completed_y = labels[:, target_c[complete]]
+                b[:, complete, :] = F.one_hot(
+                    completed_y, num_classes=num_classes
+                ).to(dtype=b.dtype)
+                b[:, complete, :] = b[:, complete, :].clamp(
+                    min=torch.finfo(b.dtype).tiny
+                ).log()
+
+            vb = unfinished_valid | complete
+            belief = b.reshape(-1, num_classes)
             belief_valid = vb.unsqueeze(0).expand(N, -1).reshape(-1)
         return X, y, belief, belief_valid
 
@@ -485,7 +542,8 @@ class ProbeLogger:
 
         Retention (offset<0): the target unit is already complete → optimum is
         deterministic (acc 1.0, nll 0). Refinement (offset 0): the teacher's
-        current-unit belief. Planning (offset>0): deferred (returns None).
+        current-unit posterior after consuming the token represented by the
+        residual. Planning (offset>0): deferred (returns None).
         """
         if offset < 0:
             probe_nll = F.cross_entropy(logits, y_eval).item()
