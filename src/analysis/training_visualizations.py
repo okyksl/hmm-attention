@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from math import prod
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -11,6 +11,11 @@ import pandas as pd
 import seaborn as sns
 
 from src.analysis.residual_phases import probe_metric_key
+from src.probe_offsets import (
+    all_probe_offsets,
+    normalize_offsets_by_level,
+    resolve_probe_offsets,
+)
 from src.visualizer import compute_attention_alignment
 
 
@@ -20,7 +25,15 @@ class ProbeLayout:
 
     num_layers: int
     slots_per_level: List[int]
-    offsets: List[int]
+    offsets: Union[List[int], List[List[int]]]
+
+    @property
+    def offsets_by_level(self) -> List[List[int]]:
+        return normalize_offsets_by_level(self.offsets, len(self.slots_per_level))
+
+    @property
+    def all_offsets(self) -> List[int]:
+        return all_probe_offsets(self.offsets_by_level)
 
 
 def probe_layout_from_config(config: Mapping[str, Any]) -> ProbeLayout:
@@ -46,28 +59,33 @@ def probe_layout_from_config(config: Mapping[str, Any]) -> ProbeLayout:
     # Chunk-code levels describe transformations between node alphabets.  Probe
     # their input alphabets plus the terminal surface alphabet, whose units are
     # individual tokens and therefore have one slot.
-    if slots:
-        slots.append(1)
+    if not slots:
+        raise ValueError("probe layout requires a hierarchical teacher")
+    slots.append(1)
 
-    configured_offsets = probe.get("offsets")
-    if configured_offsets is not None:
-        offsets = [int(offset) for offset in configured_offsets]
-    else:
-        base = teacher.get("base_teacher", teacher)
-        burn_in = base.get("burn_in")
-        if burn_in is None and base.get("span_lengths"):
-            span_lengths = list(base["span_lengths"])
-            stride = base.get("stride")
-            burn_in = (
-                (len(span_lengths) - 1) * int(stride) + span_lengths[-1]
-                if stride is not None
-                else sum(span_lengths)
-            )
-        if burn_in is None:
-            burn_in = base.get("window", config.get("dataset", {}).get("window"))
-        if burn_in is None:
-            raise ValueError("cannot infer default probe offsets from run config")
-        offsets = list(range(-int(burn_in), 2))
+    base = teacher.get("base_teacher", teacher)
+    base_burn_in = base.get("burn_in")
+    if base_burn_in is None and base.get("span_lengths"):
+        span_lengths = list(base["span_lengths"])
+        stride = base.get("stride")
+        base_burn_in = (
+            (len(span_lengths) - 1) * int(stride) + span_lengths[-1]
+            if stride is not None
+            else sum(span_lengths)
+        )
+    if base_burn_in is None:
+        base_burn_in = base.get("window", config.get("dataset", {}).get("window"))
+    if base_burn_in is None:
+        raise ValueError("cannot infer default probe offsets from run config")
+    level_spans = [prod(chunk_sizes[level:]) for level in range(len(chunk_sizes))]
+    level_spans.append(1)
+    offsets = resolve_probe_offsets(
+        level_spans,
+        surface_burn_in=int(base_burn_in) * level_spans[0],
+        configured=probe.get("offsets"),
+        # Configs from older runs lack this marker and used the legacy grid.
+        mode=probe.get("offset_mode", "legacy"),
+    )
 
     return ProbeLayout(
         num_layers=int(student["num_blocks"]) + 1,
@@ -336,6 +354,26 @@ def probe_matrix_from_metrics(
     return matrix
 
 
+def _probe_offset_matrix_from_metrics(
+    metrics: Mapping[str, Any],
+    level: int,
+    slot: int,
+    offsets: Sequence[int],
+    metric: str,
+    split: str,
+    num_layers: int,
+) -> np.ndarray:
+    """Build a layer×offset matrix for one level/slot overview facet."""
+    matrix = np.full((num_layers, len(offsets)), np.nan, dtype=np.float32)
+    for layer in range(num_layers):
+        for column, offset in enumerate(offsets):
+            key = probe_metric_key(layer, level, slot, int(offset), metric, split)
+            value = metrics.get(key)
+            if value is not None and not pd.isna(value):
+                matrix[layer, column] = float(value)
+    return matrix
+
+
 def plot_probe_heatmap(
     matrix: np.ndarray,
     level: int,
@@ -477,7 +515,7 @@ def probe_slice_from_metrics(
     split: str,
     num_layers: int,
     slots_per_level: Sequence[int],
-    offsets: Sequence[int],
+    offsets: Union[Sequence[int], Sequence[Sequence[int]]],
 ) -> tuple[np.ndarray, List[str], List[str]]:
     """Build a 2-D probe slice while fixing the two remaining coordinates."""
     if x_dimension == y_dimension:
@@ -487,11 +525,18 @@ def probe_slice_from_metrics(
     if not slots_per_level:
         raise ValueError("probe slice requires at least one teacher level")
 
+    offsets_by_level = normalize_offsets_by_level(offsets, len(slots_per_level))
+    level_is_axis = "level" in {x_dimension, y_dimension}
+    offset_values = (
+        all_probe_offsets(offsets_by_level)
+        if level_is_axis
+        else offsets_by_level[int(coordinates["level"])]
+    )
     x_values = _probe_dimension_values(
-        x_dimension, num_layers, slots_per_level, offsets
+        x_dimension, num_layers, slots_per_level, offset_values
     )
     y_values = _probe_dimension_values(
-        y_dimension, num_layers, slots_per_level, offsets
+        y_dimension, num_layers, slots_per_level, offset_values
     )
     matrix = np.full((len(y_values), len(x_values)), np.nan, dtype=np.float32)
 
@@ -506,6 +551,8 @@ def probe_slice_from_metrics(
             if level < 0 or level >= len(slots_per_level):
                 continue
             if slot < 0 or slot >= int(slots_per_level[level]):
+                continue
+            if point["offset"] not in offsets_by_level[level]:
                 continue
             key = probe_metric_key(
                 point["layer"], level, slot, point["offset"], metric, split
@@ -572,7 +619,7 @@ def plot_probe_slice(
     split: str,
     num_layers: int,
     slots_per_level: Sequence[int],
-    offsets: Sequence[int],
+    offsets: Union[Sequence[int], Sequence[Sequence[int]]],
 ) -> plt.Figure:
     """Plot a selectable two-dimensional slice of one probe snapshot."""
     matrix, x_labels, y_labels = probe_slice_from_metrics(
@@ -611,43 +658,55 @@ def plot_probe_overview(
     split: str,
     num_layers: int,
     slots_per_level: Sequence[int],
-    offsets: Sequence[int],
+    offsets: Union[Sequence[int], Sequence[Sequence[int]]],
 ) -> plt.Figure:
-    """Plot every layer/level/slot/offset value as a faceted snapshot."""
-    matrices = [
-        probe_matrix_from_metrics(
-            metrics, level, int(offset), metric, split,
-            num_layers, int(slots_per_level[level]),
+    """Plot all probes as level×slot facets with offsets on each x-axis.
+
+    Putting offsets inside each heatmap keeps automatic fine-level ranges from
+    creating dozens of subplot columns. Tick thinning remains local to each
+    level's actual range.
+    """
+    offsets_by_level = normalize_offsets_by_level(offsets, len(slots_per_level))
+    matrices = {
+        (level, slot): _probe_offset_matrix_from_metrics(
+            metrics, level, slot, offsets_by_level[level], metric, split,
+            num_layers,
         )
         for level in range(len(slots_per_level))
-        for offset in offsets
-    ]
-    if not matrices or all(np.isnan(matrix).all() for matrix in matrices):
+        for slot in range(int(slots_per_level[level]))
+    }
+    if not matrices or all(np.isnan(matrix).all() for matrix in matrices.values()):
         raise ValueError("this probe overview has no logged values")
-    vmin, vmax, cmap, metric_label = _probe_color_scale(metric, matrices)
+    vmin, vmax, cmap, metric_label = _probe_color_scale(
+        metric, list(matrices.values())
+    )
     num_rows = len(slots_per_level)
-    num_columns = len(offsets)
+    num_columns = max(int(count) for count in slots_per_level)
     figure, axes = plt.subplots(
         num_rows, num_columns,
-        figsize=(max(5.0, 2.5 * num_columns), max(3.5, 2.3 * num_rows)),
+        figsize=(max(5.0, 4.0 * num_columns), max(3.5, 2.5 * num_rows)),
         squeeze=False, constrained_layout=True,
     )
     image = None
-    matrix_index = 0
     for level in range(num_rows):
-        for column, offset in enumerate(offsets):
-            axis = axes[level, column]
-            matrix = matrices[matrix_index]
-            matrix_index += 1
-            x_labels = [f"slot{slot}" for slot in range(matrix.shape[1])]
+        for slot in range(num_columns):
+            axis = axes[level, slot]
+            if slot >= int(slots_per_level[level]):
+                axis.set_visible(False)
+                continue
+            matrix = matrices[(level, slot)]
+            x_labels = [
+                _probe_dimension_label("offset", int(offset))
+                for offset in offsets_by_level[level]
+            ]
             y_labels = [f"L{layer}" for layer in range(matrix.shape[0])]
             image = _draw_probe_matrix(
                 axis, matrix, x_labels, y_labels, vmin, vmax, cmap
             )
-            axis.set_title(f"level{level}, k={int(offset):+d}", fontsize=10)
+            axis.set_title(f"level{level}, slot{slot}", fontsize=10)
             if level == num_rows - 1:
-                axis.set_xlabel("slot")
-            if column == 0:
+                axis.set_xlabel("offset")
+            if slot == 0:
                 axis.set_ylabel("layer")
             if np.isnan(matrix).all():
                 axis.text(

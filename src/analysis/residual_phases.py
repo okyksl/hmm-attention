@@ -6,6 +6,7 @@ either the teacher hierarchy or the student is deep.  The probe logger already
 provides a more stable coordinate system:
 
 ``(residual layer, teacher level, within-unit slot, relative-unit offset)``.
+Teacher levels include the terminal surface-token level.
 
 This module turns those scalar histories into comparable trajectories and
 stable acquisition events.  Its primary score normalizes the logged excess NLL
@@ -27,10 +28,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from math import log, prod
-from typing import Any, List, Mapping, Optional, Sequence
+from typing import Any, List, Mapping, Optional, Sequence, Union
 
 import numpy as np
 import pandas as pd
+
+from src.probe_offsets import (
+    all_probe_offsets,
+    normalize_offsets_by_level,
+    resolve_probe_offsets,
+)
 
 
 PROBE_METRICS = (
@@ -70,13 +77,14 @@ class ProbeSpec:
     ``num_layers`` includes ``L0`` (post input/position encoder), so a student
     with ``N`` transformer blocks has ``N + 1`` probed residual streams.
     ``slots_per_level`` and ``class_counts`` are ordered top-to-bottom in the
-    teacher hierarchy.
+    teacher hierarchy and include the terminal surface-token level.
     """
 
     num_layers: int
     slots_per_level: List[int]
-    offsets: List[int]
+    offsets: Union[List[int], List[List[int]]]
     class_counts: List[int]
+    slot_mode: str = "coarse"
 
     def __post_init__(self) -> None:
         if self.num_layers < 1:
@@ -87,6 +95,9 @@ class ProbeSpec:
             raise ValueError("every teacher level must have at least one slot")
         if any(n < 2 for n in self.class_counts):
             raise ValueError("every probed alphabet must contain at least two classes")
+        if self.slot_mode not in {"surface", "coarse"}:
+            raise ValueError("slot_mode must be 'surface' or 'coarse'")
+        normalize_offsets_by_level(self.offsets, self.num_levels)
 
     @property
     def num_levels(self) -> int:
@@ -95,16 +106,23 @@ class ProbeSpec:
     @property
     def level_spans(self) -> List[int]:
         """Number of surface tokens covered by one unit at each level."""
+        if self.slot_mode == "surface":
+            return list(self.slots_per_level)
         return [prod(self.slots_per_level[level:]) for level in range(self.num_levels)]
 
+    @property
+    def offsets_by_level(self) -> List[List[int]]:
+        """Configured offsets normalized to one list per teacher level."""
+        return normalize_offsets_by_level(self.offsets, self.num_levels)
 
-def _default_offsets(config: Mapping[str, Any]) -> List[int]:
+    @property
+    def all_offsets(self) -> List[int]:
+        """Sorted union for plots whose level is itself an axis."""
+        return all_probe_offsets(self.offsets_by_level)
+
+
+def _base_burn_in(config: Mapping[str, Any]) -> int:
     teacher = config["teacher"]
-    probe = config.get("misc", {}).get("probe", {})
-    configured = probe.get("offsets")
-    if configured is not None:
-        return [int(offset) for offset in configured]
-
     base = teacher.get("base_teacher", teacher)
     burn_in = base.get("burn_in")
     if burn_in is None and base.get("span_lengths"):
@@ -119,7 +137,7 @@ def _default_offsets(config: Mapping[str, Any]) -> List[int]:
         burn_in = base.get("window", config.get("dataset", {}).get("window"))
     if burn_in is None:
         raise ValueError("cannot infer default probe offsets from run config")
-    return list(range(-int(burn_in), 2))
+    return int(burn_in)
 
 
 def probe_spec_from_config(config: Mapping[str, Any]) -> ProbeSpec:
@@ -127,31 +145,80 @@ def probe_spec_from_config(config: Mapping[str, Any]) -> ProbeSpec:
     teacher = config["teacher"]
     student = config["student"]
     base = teacher.get("base_teacher", teacher)
+    dataset_dim = config.get("dataset", {}).get("dim")
+    probe = config.get("misc", {}).get("probe", {})
+
+    def resolved_dim(value: Any) -> int:
+        if value is None:
+            if dataset_dim is None:
+                raise ValueError("cannot infer the terminal surface alphabet size")
+            return int(dataset_dim)
+        dimension = int(value)
+        if dimension == -1:
+            if dataset_dim is None:
+                raise ValueError("chunk_dim=-1 requires dataset.dim")
+            return int(dataset_dim)
+        return dimension
 
     if "levels" in teacher:
         levels = list(teacher["levels"])
-        slots = [int(level.get("chunk_size", level.get("size"))) for level in levels]
+        chunk_sizes = [
+            int(level.get("chunk_size", level.get("size"))) for level in levels
+        ]
         base_dim = int(base["dim"])
-        # level0 decodes base symbols; every later level decodes the output
-        # alphabet of the level immediately above it.
         class_counts = [base_dim] + [
-            int(level.get("chunk_dim", level.get("out_dim")))
-            for level in levels[:-1]
+            resolved_dim(level.get("chunk_dim", level.get("out_dim")))
+            for level in levels
+        ]
+    elif "chunk_sizes" in teacher:
+        chunk_sizes = [int(size) for size in teacher["chunk_sizes"]]
+        dimensions = list(teacher.get("chunk_dims", []))
+        if len(dimensions) != len(chunk_sizes):
+            raise ValueError("teacher.chunk_dims and chunk_sizes must have equal length")
+        class_counts = [int(base["dim"])] + [
+            resolved_dim(dimension) for dimension in dimensions
         ]
     elif "chunk_size" in teacher:
-        slots = [int(teacher["chunk_size"])]
-        class_counts = [int(base["dim"])]
+        chunk_sizes = [int(teacher["chunk_size"])]
+        class_counts = [
+            int(base["dim"]),
+            resolved_dim(teacher.get("chunk_dim", teacher.get("dim"))),
+        ]
     else:
         raise ValueError(
             "probe analysis requires a hierarchical teacher config with "
-            "teacher.levels or teacher.chunk_size"
+            "teacher.levels, teacher.chunk_sizes, or teacher.chunk_size"
         )
+
+    slot_mode = probe.get("slot_mode", "coarse")
+    if slot_mode == "surface":
+        slots = [prod(chunk_sizes[level:]) for level in range(len(chunk_sizes))]
+    elif slot_mode == "coarse":
+        slots = list(chunk_sizes)
+    else:
+        raise ValueError("probe slot_mode must be 'surface' or 'coarse'")
+    # The terminal surface level has one token per unit and therefore one slot.
+    slots.append(1)
+
+    level_spans = [prod(chunk_sizes[level:]) for level in range(len(chunk_sizes))]
+    level_spans.append(1)
+    configured_offsets = probe.get("offsets")
+    # Runs created before level-aware offsets had no mode field and used the
+    # same base-unit range at every level. Preserve their readable layout.
+    offset_mode = probe.get("offset_mode", "legacy")
+    offsets_by_level = resolve_probe_offsets(
+        level_spans,
+        surface_burn_in=_base_burn_in(config) * level_spans[0],
+        configured=configured_offsets,
+        mode=offset_mode,
+    )
 
     return ProbeSpec(
         num_layers=int(student["num_blocks"]) + 1,
         slots_per_level=slots,
-        offsets=_default_offsets(config),
+        offsets=offsets_by_level,
         class_counts=class_counts,
+        slot_mode=slot_mode,
     )
 
 
@@ -189,7 +256,7 @@ def probe_metric_keys(
         probe_metric_key(layer, level, slot, offset, metric, split)
         for level, num_slots in enumerate(spec.slots_per_level)
         for slot in range(num_slots)
-        for offset in spec.offsets
+        for offset in spec.offsets_by_level[level]
         for layer in range(spec.num_layers)
         for metric in metrics
         if offset <= 0 or metric not in BAYES_METRICS
@@ -228,9 +295,8 @@ def probe_history_long(
         clipped, preserving below-chance results and ceiling overshoots.
     ``nll_progress``
         ``1 - excess_nll / (log(number_of_classes) - bayes_nll)``.  This is the
-        preferred cross-level score: ``excess_nll`` compares probe and Bayes on
-        the same valid rows, whereas the logger's raw ``acc`` and ``bayes_acc``
-        can use slightly different row masks for current-unit refinement.
+        preferred cross-level score because it accounts for each level's
+        alphabet size and intrinsic Bayes uncertainty.
 
     Missing optional metrics remain NaN.  With ``strict=False`` (the default),
     missing accuracy cells are skipped; ``missing_probe_cells`` can be used to
@@ -244,7 +310,7 @@ def probe_history_long(
     for level, num_slots in enumerate(spec.slots_per_level):
         chance = 1.0 / spec.class_counts[level]
         for slot in range(num_slots):
-            for offset in spec.offsets:
+            for offset in spec.offsets_by_level[level]:
                 for layer in range(spec.num_layers):
                     keys = {
                         metric: probe_metric_key(
@@ -304,7 +370,9 @@ def probe_history_long(
             f"missing {len(missing)} probe accuracy series, e.g. {missing[0]!r}"
         )
     if not rows:
-        example = probe_metric_key(0, 0, 0, spec.offsets[0], "acc", split)
+        example = probe_metric_key(
+            0, 0, 0, spec.offsets_by_level[0][0], "acc", split
+        )
         raise KeyError(
             "no probe accuracy histories matched the resolved layout; "
             f"for example expected {example!r}"
@@ -341,7 +409,7 @@ def missing_probe_cells(
     rows = []
     for level, num_slots in enumerate(spec.slots_per_level):
         for slot in range(num_slots):
-            for offset in spec.offsets:
+            for offset in spec.offsets_by_level[level]:
                 for layer in range(spec.num_layers):
                     key = probe_metric_key(layer, level, slot, offset, "acc", split)
                     if key not in history or history[key].notna().sum() == 0:

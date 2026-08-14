@@ -12,6 +12,8 @@ from IPython.display import clear_output, display
 from matplotlib.figure import Figure
 from tqdm.auto import tqdm
 
+from src.probe_offsets import all_probe_offsets, normalize_offsets_by_level
+
 
 @dataclass
 class FigureGallery:
@@ -242,12 +244,13 @@ def _replaceable_widget_output(
 def show_probe_selector(
     num_layers: int,
     slots_per_level: Sequence[int],
-    offsets: Sequence[int],
+    offsets: Sequence[int] | Sequence[Sequence[int]],
     renderer: Callable[[int, int, int, int, str], widgets.Widget | None],
 ) -> tuple[dict[str, widgets.Widget], widgets.VBox]:
     """Display linked coordinates and metric controls for one probe plot."""
-    if num_layers < 1 or not slots_per_level or not offsets:
+    if num_layers < 1 or not slots_per_level:
         raise ValueError("probe selectors require non-empty layout dimensions")
+    offsets_by_level = normalize_offsets_by_level(offsets, len(slots_per_level))
 
     layer = widgets.Dropdown(
         options=[(f"L{index}", index) for index in range(num_layers)],
@@ -266,7 +269,7 @@ def show_probe_selector(
         layout=widgets.Layout(width="135px"),
         style={"description_width": "initial"},
     )
-    offset_values = [int(offset) for offset in offsets]
+    offset_values = offsets_by_level[0]
     offset = widgets.Dropdown(
         options=[(f"k={value:+d}" if value else "k=0", value)
                  for value in offset_values],
@@ -299,8 +302,21 @@ def show_probe_selector(
             )
             slot.value = fallback
 
+    def update_offsets(change: dict[str, Any] | None = None) -> None:
+        del change
+        values = offsets_by_level[int(level.value)]
+        options = [
+            (f"k={value:+d}" if value else "k=0", value) for value in values
+        ]
+        current_offset = offset.value
+        offset.options = options
+        if current_offset not in set(values):
+            offset.value = 0 if 0 in values else values[0]
+
     level.observe(update_slots, names="value")
+    level.observe(update_offsets, names="value")
     update_slots()
+    update_offsets()
 
     def update_metrics(change: dict[str, Any] | None = None) -> None:
         del change
@@ -334,13 +350,14 @@ def show_probe_snapshot_selector(
     steps: Sequence[int],
     num_layers: int,
     slots_per_level: Sequence[int],
-    offsets: Sequence[int],
+    offsets: Sequence[int] | Sequence[Sequence[int]],
     renderer: Callable[..., widgets.Widget | None],
 ) -> tuple[dict[str, widgets.Widget], widgets.VBox]:
     """Display controls for a fixed-step probe slice or complete overview."""
     available_steps = sorted({int(step) for step in steps})
-    if not available_steps or num_layers < 1 or not slots_per_level or not offsets:
+    if not available_steps or num_layers < 1 or not slots_per_level:
         raise ValueError("probe snapshot selectors require non-empty dimensions")
+    offsets_by_level = normalize_offsets_by_level(offsets, len(slots_per_level))
 
     step = widgets.SelectionSlider(
         options=available_steps, value=available_steps[-1],
@@ -389,7 +406,7 @@ def show_probe_snapshot_selector(
         description="Slot", layout=widgets.Layout(width="135px"),
         style={"description_width": "initial"},
     )
-    offset_values = [int(value) for value in offsets]
+    offset_values = offsets_by_level[0]
     offset = widgets.Dropdown(
         options=[(f"k={value:+d}" if value else "k=0", value)
                  for value in offset_values],
@@ -423,6 +440,22 @@ def show_probe_snapshot_selector(
         valid = {value for _, value in options}
         if current not in valid:
             slot.value = 0 if current is None else min(int(current), slot_count - 1)
+
+    def update_offsets(change: dict[str, Any] | None = None) -> None:
+        del change
+        level_is_axis = "level" in {x_axis.value, y_axis.value}
+        values = (
+            all_probe_offsets(offsets_by_level)
+            if level_is_axis
+            else offsets_by_level[int(level.value)]
+        )
+        options = [
+            (f"k={value:+d}" if value else "k=0", value) for value in values
+        ]
+        current = offset.value
+        offset.options = options
+        if current not in set(values):
+            offset.value = 0 if 0 in values else values[0]
 
     def update_metric(change: dict[str, Any] | None = None) -> None:
         del change
@@ -458,6 +491,9 @@ def show_probe_snapshot_selector(
     x_axis.observe(update_slots, names="value")
     y_axis.observe(update_slots, names="value")
     level.observe(update_slots, names="value")
+    x_axis.observe(update_offsets, names="value")
+    y_axis.observe(update_offsets, names="value")
+    level.observe(update_offsets, names="value")
     x_axis.observe(update_metric, names="value")
     y_axis.observe(update_metric, names="value")
     offset.observe(update_metric, names="value")
@@ -467,6 +503,7 @@ def show_probe_snapshot_selector(
     view.observe(update_view, names="value")
     update_y_axis()
     update_slots()
+    update_offsets()
     update_metric()
     update_view()
 

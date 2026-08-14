@@ -58,8 +58,12 @@ def test_enabled_and_level_specs():
     assert pl.level_coarse_arity == [2, 3, 1]
     assert pl.level_alphabet == [6, 4, 8]  # base + mid + surface
     assert pl.level_spans == [6, 3, 1, 1]
-    # Default offsets: base_ctx = base_teacher.burn_in = 2 -> [-2, -1, 0, 1].
-    assert pl.offsets == [-2, -1, 0, 1]
+    # Common surface horizons become progressively more level units.
+    assert pl.offsets_by_level == [
+        [-2, -1, 0, 1],
+        [-4, -3, -2, -1, 0, 1, 2],
+        list(range(-12, 7)),
+    ]
 
 
 def test_gather_level_digit_and_targets():
@@ -131,6 +135,30 @@ def test_sharing_and_slot_modes_are_independent(
         assert fitted_slots == {None}
     else:
         assert None not in fitted_slots
+
+
+def test_auto_grid_logs_only_offsets_resolved_for_each_level():
+    teacher = _make_teacher(k=(2, 3), dims=(6, 4, 8), base_window=2)
+    writer = _FakeWriter()
+    student = _make_student(dim=teacher.dim, hidden_dim=16)
+    cfg = LoggingConfig(
+        writer=None, probe_mode="sgd", probe_frequency=1,
+        probe_train_frac=0.5,
+    )
+    pl = ProbeLogger(writer=writer, teacher=teacher, student=student, cfg=cfg)
+    data = teacher.sample_surface_prefix(5 * teacher.total, batch_size=3)
+    pl._current_data = data
+    pl._current_residuals = ((0, torch.randn(3, data.shape[1] - 1, 16)),)
+    pl.collect_val_batch()
+
+    pl.log(step=0, split="val")
+
+    keys = set(writer.logged)
+    assert any("/level2/slot0/k+6/acc/val" in key for key in keys)
+    assert any("/level1/slot0/k+2/acc/val" in key for key in keys)
+    assert any("/level0/slot0/k+1/acc/val" in key for key in keys)
+    assert not any("/level0/" in key and "/k+2/" in key for key in keys)
+    assert not any("/level1/" in key and "/k+3/" in key for key in keys)
 
 
 def test_bayes_ceiling_retention_and_refinement():
@@ -318,7 +346,10 @@ def test_end_to_end_log_emits_per_level_metrics():
     teacher = _make_teacher(k=(2, 3), dims=(6, 4, 8))
     writer = _FakeWriter()
     student = _make_student(dim=teacher.dim, hidden_dim=16)
-    cfg = LoggingConfig(writer=None, probe_mode="warm_start", probe_frequency=1)
+    cfg = LoggingConfig(
+        writer=None, probe_mode="warm_start", probe_frequency=1,
+        probe_offsets=[-1, 0],
+    )
     pl = ProbeLogger(writer=writer, teacher=teacher, student=student, cfg=cfg)
 
     N, n_chunks = 4, 6

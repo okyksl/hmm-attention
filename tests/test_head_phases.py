@@ -613,3 +613,48 @@ def test_phase_table_auto_excludes_when_the_student_has_a_skip_connection():
     assert row["excluded"] == ["-1"]
     assert row["predicted_order"] == ["-2", "-3"]
     assert bool(row["order_matches"]) is True
+
+
+# ---- degenerate (tied) importance laws ---------------------------------------
+
+
+def test_flat_law_is_scored_as_undefined_not_as_the_tie_break_order():
+    """alpha == 0 ties every span, so there is no prediction to be right about."""
+    df = _synthetic_run(onsets=(800, 400, 50), run_id="a")
+    df["cfg.teacher.lag_spectrum.law"] = "power"
+    df["cfg.teacher.lag_spectrum.alpha"] = 0.0        # every weight == 1
+    df["cfg.teacher.lag_spectrum.normalize"] = "none"
+    df["cfg.teacher.lag_spectrum.reverse"] = True
+
+    row = phase_table(df, num_heads=3, num_spans=3, span_lengths=[1, 1, 1]).iloc[0]
+    assert bool(row["predicted_degenerate"]) is True
+    assert row["order_matches"] is None
+    assert row["order_rank_corr"] is None
+
+
+def test_negative_alpha_flips_which_end_is_most_important():
+    """alpha < 0 with reverse=true makes the OLDEST span the important one."""
+    from src.analysis.head_phases import predicted_span_order
+
+    def cfg(alpha):
+        return {
+            "cfg.teacher.lag_spectrum.law": "power",
+            "cfg.teacher.lag_spectrum.alpha": alpha,
+            "cfg.teacher.lag_spectrum.normalize": "none",
+            "cfg.teacher.lag_spectrum.reverse": True,
+        }
+
+    assert predicted_span_order(cfg(1.0), 4) == [3, 2, 1, 0]   # recency-ordered
+    assert predicted_span_order(cfg(-1.0), 4) == [0, 1, 2, 3]  # anti-recency
+
+
+def test_non_degenerate_law_still_scores_normally():
+    df = _synthetic_run(onsets=(800, 400, 50), run_id="a")
+    df["cfg.teacher.lag_spectrum.law"] = "power"
+    df["cfg.teacher.lag_spectrum.alpha"] = 1.0
+    df["cfg.teacher.lag_spectrum.normalize"] = "none"
+    df["cfg.teacher.lag_spectrum.reverse"] = True
+
+    row = phase_table(df, num_heads=3, num_spans=3, span_lengths=[1, 1, 1]).iloc[0]
+    assert bool(row["predicted_degenerate"]) is False
+    assert row["order_rank_corr"] is not None

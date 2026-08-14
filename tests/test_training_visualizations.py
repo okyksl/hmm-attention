@@ -184,8 +184,37 @@ def test_probe_overview_facets_levels_and_offsets_in_one_figure():
         slots_per_level=[1, 2], offsets=[-1, 0],
     )
 
-    assert len(figure.axes) == 5  # four facets plus one shared colorbar
+    assert len([axis for axis in figure.axes[:-1] if axis.get_visible()]) == 3
     assert figure._suptitle.get_text() == "All probe accuracy at step 100"
+    plt.close(figure)
+
+
+def test_probe_overview_supports_level_specific_offset_ranges():
+    offsets = [[-1, 0], [-2, -1, 0, 1]]
+    metrics = {
+        f"probe/L0/level{level}/slot0/"
+        f"{'k+' if offset > 0 else 'k'}{offset}/acc/val": 0.5
+        for level, level_offsets in enumerate(offsets)
+        for offset in level_offsets
+    }
+
+    figure = plot_probe_overview(
+        metrics, 100, "acc", "val", num_layers=1,
+        slots_per_level=[1, 1], offsets=offsets,
+    )
+
+    visible_axes = [axis for axis in figure.axes[:-1] if axis.get_visible()]
+    assert len(visible_axes) == 2
+    assert {axis.get_title() for axis in visible_axes} == {
+        "level0, slot0", "level1, slot0",
+    }
+    by_title = {axis.get_title(): axis for axis in visible_axes}
+    assert [tick.get_text() for tick in by_title["level0, slot0"].get_xticklabels()] == [
+        "k=-1", "k=0",
+    ]
+    assert [tick.get_text() for tick in by_title["level1, slot0"].get_xticklabels()] == [
+        "k=-2", "k=-1", "k=0", "k=+1",
+    ]
     plt.close(figure)
 
 
@@ -197,14 +226,24 @@ def test_probe_layout_matches_resolved_multilevel_config():
             "levels": [{"chunk_size": 2}, {"chunk_size": 3}],
         },
         "student": {"num_blocks": 2},
-        "misc": {"probe": {"offsets": None}},
+        "misc": {
+            "probe": {
+                "offsets": None,
+                "offset_mode": "auto",
+                "slot_mode": "surface",
+            }
+        },
     }
 
     layout = probe_layout_from_config(config)
 
     assert layout.num_layers == 3
-    assert layout.slots_per_level == [2, 3]
-    assert layout.offsets == [-3, -2, -1, 0, 1]
+    assert layout.slots_per_level == [6, 3, 1]
+    assert layout.offsets_by_level == [
+        [-3, -2, -1, 0, 1],
+        list(range(-6, 3)),
+        list(range(-18, 7)),
+    ]
 
 
 def test_probe_layout_matches_parallel_chunk_size_config():
@@ -215,14 +254,20 @@ def test_probe_layout_matches_parallel_chunk_size_config():
             "chunk_sizes": [2, 3],
         },
         "student": {"num_blocks": 3},
-        "misc": {"probe": {"offsets": None}},
+        "misc": {"probe": {"offsets": None, "slot_mode": "surface"}},
     }
 
     layout = probe_layout_from_config(config)
 
     assert layout.num_layers == 4
-    assert layout.slots_per_level == [2, 3]
-    assert layout.offsets == [-3, -2, -1, 0, 1]
+    assert layout.slots_per_level == [6, 3, 1]
+    # No offset_mode marks an older run, whose null offsets used the same
+    # base-level range at every level.
+    assert layout.offsets_by_level == [
+        [-3, -2, -1, 0, 1],
+        [-3, -2, -1, 0, 1],
+        [-3, -2, -1, 0, 1],
+    ]
 
 
 class _FakeDownload:

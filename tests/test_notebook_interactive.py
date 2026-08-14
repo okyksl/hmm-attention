@@ -65,7 +65,7 @@ def test_probe_selector_links_level_to_valid_slots(monkeypatch):
     controls, _ = show_probe_selector(
         num_layers=4,
         slots_per_level=[2, 3],
-        offsets=[-1, 0, 1],
+        offsets=[[-1, 0, 1], [-3, -2, -1, 0, 1, 2]],
         renderer=lambda layer, level, slot, offset, metric: rendered.append(
             (layer, level, slot, offset, metric)
         ),
@@ -76,6 +76,9 @@ def test_probe_selector_links_level_to_valid_slots(monkeypatch):
     assert [value for _, value in controls["slot"].options] == [0, 1]
     controls["level"].value = 1
     assert [value for _, value in controls["slot"].options] == [0, 1, 2]
+    assert [value for _, value in controls["offset"].options] == [
+        -3, -2, -1, 0, 1, 2,
+    ]
     controls["layer"].value = 3
     controls["slot"].value = 2
     controls["offset"].value = -1
@@ -97,7 +100,7 @@ def test_probe_snapshot_selector_switches_axes_and_overview(monkeypatch):
         steps=[0, 100],
         num_layers=4,
         slots_per_level=[2, 3],
-        offsets=[-1, 0, 1],
+        offsets=[[-1, 0, 1], [-3, -2, -1, 0, 1, 2]],
         renderer=lambda **selection: rendered.append(selection),
     )
 
@@ -110,6 +113,9 @@ def test_probe_snapshot_selector_switches_axes_and_overview(monkeypatch):
     controls["x_axis"].value = "level"
     assert controls["y_axis"].value != "level"
     assert [value for _, value in controls["slot"].options] == [0, 1, 2]
+    assert [value for _, value in controls["offset"].options] == [
+        -3, -2, -1, 0, 1, 2,
+    ]
     controls["offset"].value = 1
     assert list(controls["metric"].options) == [("Accuracy", "acc")]
     controls["view"].value = "overview"

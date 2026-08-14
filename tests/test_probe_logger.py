@@ -76,8 +76,12 @@ def test_offsets_default_from_teacher():
     student = _make_student(dim=teacher.chunk_dim, hidden_dim=16)
     cfg = LoggingConfig(writer=None, probe_mode="warm_start", probe_offsets=None)
     pl = ProbeLogger(writer=None, teacher=teacher, student=student, cfg=cfg)
-    # base_teacher.context_length == 3 → [-3, -2, -1, 0, +1]
-    assert pl.offsets == [-3, -2, -1, 0, 1]
+    # Same surface horizons at both levels: context=6 surface tokens and
+    # planning=2 surface tokens. The surface level therefore gets more k's.
+    assert pl.offsets_by_level == [
+        [-3, -2, -1, 0, 1],
+        [-6, -5, -4, -3, -2, -1, 0, 1, 2],
+    ]
 
 
 def test_single_code_level_also_probes_terminal_surface_level():

@@ -35,7 +35,13 @@ def _config():
             },
         },
         "student": {"num_blocks": 3},
-        "misc": {"probe": {"offsets": None}},
+        "misc": {
+            "probe": {
+                "offsets": None,
+                "offset_mode": "auto",
+                "slot_mode": "surface",
+            }
+        },
         "dataset": {"window": 2},
     }
 
@@ -43,27 +49,66 @@ def _config():
 def test_probe_spec_from_multilevel_config():
     spec = probe_spec_from_config(_config())
     assert spec.num_layers == 4  # L0 plus three transformer blocks
-    assert spec.slots_per_level == [2, 3]
-    assert spec.class_counts == [7, 5]
-    assert spec.offsets == [-2, -1, 0, 1]
-    assert spec.level_spans == [6, 3]
+    assert spec.slots_per_level == [6, 3, 1]
+    assert spec.class_counts == [7, 5, 9]
+    assert spec.offsets_by_level == [
+        [-2, -1, 0, 1],
+        [-4, -3, -2, -1, 0, 1, 2],
+        list(range(-12, 7)),
+    ]
+    assert spec.level_spans == [6, 3, 1]
 
 
 def test_probe_spec_from_single_level_hierarchical_config():
     config = {
         "teacher": {
             "chunk_size": 4,
+            "chunk_dim": 13,
             "base_teacher": {"dim": 11, "burn_in": 3},
         },
         "student": {"num_blocks": 1},
-        "misc": {"probe": {"offsets": [-1, 0]}},
+        "misc": {"probe": {"offsets": [-1, 0], "slot_mode": "surface"}},
     }
     assert probe_spec_from_config(config) == ProbeSpec(
         num_layers=2,
-        slots_per_level=[4],
-        offsets=[-1, 0],
-        class_counts=[11],
+        slots_per_level=[4, 1],
+        offsets=[[-1, 0], [-1, 0]],
+        class_counts=[11, 13],
+        slot_mode="surface",
     )
+
+
+def test_probe_spec_from_parallel_multilevel_config_includes_surface():
+    config = {
+        "teacher": {
+            "chunk_sizes": [2, 3],
+            "chunk_dims": [5, -1],
+            "base_teacher": {"dim": 7, "burn_in": 2},
+        },
+        "student": {"num_blocks": 1},
+        "dataset": {"dim": 9},
+        "misc": {
+            "probe": {"offsets": [-1, 0, 1], "slot_mode": "surface"}
+        },
+    }
+
+    assert probe_spec_from_config(config) == ProbeSpec(
+        num_layers=2,
+        slots_per_level=[6, 3, 1],
+        offsets=[[-1, 0, 1], [-1, 0, 1], [-1, 0, 1]],
+        class_counts=[7, 5, 9],
+        slot_mode="surface",
+    )
+
+
+def test_probe_spec_retains_coarse_slot_mode():
+    config = _config()
+    config["misc"]["probe"]["slot_mode"] = "coarse"
+
+    spec = probe_spec_from_config(config)
+
+    assert spec.slots_per_level == [2, 3, 1]
+    assert spec.level_spans == [6, 3, 1]
 
 
 def test_probe_keys_match_logger_schema():

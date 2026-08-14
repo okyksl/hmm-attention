@@ -47,6 +47,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.model import TransformerDecoder
+from src.probe_offsets import all_probe_offsets, resolve_probe_offsets
 from src.teachers import MultiLevelHierarchicalTeacher
 from src.trainer.config import LoggingConfig
 
@@ -124,16 +125,6 @@ class ProbeLogger:
         if not self.enabled:
             return
 
-        # Adaptive default: cover the base teacher's AR context window on the
-        # retention side, plus one step of lookahead. `burn_in` == context_length
-        # for bounded bases; for an adaptive (unbounded) base there is no finite
-        # window, so burn_in is the finite fallback — override via probe_offsets.
-        if cfg.probe_offsets is None:
-            base_ctx = teacher.base_teacher.burn_in
-            self.offsets: List[int] = list(range(-base_ctx, 2))
-        else:
-            self.offsets = list(cfg.probe_offsets)
-
         # Probe every node alphabet in the generative path: the input alphabet
         # of each chunk-code level, followed by its terminal surface output.
         # The synthetic child span on the terminal level keeps the usual
@@ -153,6 +144,15 @@ class ProbeLogger:
             teacher.levels[l].in_dim for l in range(self.num_latent_levels)
         ] + [teacher.dim]
         self.burn_in = teacher.burn_in
+        self.offsets_by_level = resolve_probe_offsets(
+            self.level_spans[: self.num_levels],
+            surface_burn_in=self.burn_in,
+            configured=cfg.probe_offsets,
+            mode=cfg.probe_offset_mode,
+        )
+        # Convenience union for diagnostics/backward-compatible inspection;
+        # fitting and logging always use the appropriate per-level list.
+        self.offsets: List[int] = all_probe_offsets(self.offsets_by_level)
         self.num_blocks = student.num_blocks
 
         # Layer 0 = post pos-encoder; layers 1..N = post each DecoderBlock.
@@ -246,7 +246,7 @@ class ProbeLogger:
                     else list(range(self.level_arity[level]))
                 )
                 for fitted_slot in fitted_slots:
-                    for offset in self.offsets:
+                    for offset in self.offsets_by_level[level]:
                         X, y, _, _ = self._gather_level(
                             residual, labels, None, level, fitted_slot, offset
                         )
@@ -297,7 +297,7 @@ class ProbeLogger:
         for layer_idx, R in residuals.items():
             for level in range(self.num_levels):
                 labels = labels_per_level[level]
-                for offset in self.offsets:
+                for offset in self.offsets_by_level[level]:
                     if self.sharing == "shared":
                         X_all, y_all, _, _ = self._gather_level(
                             R, labels, None, level, None, offset

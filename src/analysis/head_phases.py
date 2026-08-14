@@ -369,6 +369,10 @@ class RunPhases:
     #: Spans left out of the order comparison (e.g. supplied by a skip
     #: connection). They still appear in `summary` and `acquired`.
     excluded_spans: List[int] = field(default_factory=list)
+    #: True when the config's importance law ties two comparable spans, so no
+    #: order is predicted at all (e.g. a flat law, or `alpha == 0`). The order
+    #: metrics report `None` rather than scoring an arbitrary tie-break.
+    predicted_degenerate: bool = False
 
     def _label(self, span: int) -> str:
         return "diffuse" if span == DIFFUSE else self.span_labels[span]
@@ -446,6 +450,8 @@ class RunPhases:
     @property
     def order_matches_importance(self) -> Optional[bool]:
         observed = self.comparable_order
+        if self.predicted_degenerate:
+            return None
         if not self.predicted_order or len(observed) != len(self.predicted_order):
             return None
         return observed == self.predicted_order
@@ -454,6 +460,8 @@ class RunPhases:
     def order_rank_corr(self) -> Optional[float]:
         """Spearman correlation between predicted and observed acquisition order."""
         observed = self.comparable_order
+        if self.predicted_degenerate:
+            return None
         if not self.predicted_order or len(observed) != len(self.predicted_order):
             return None
         n = len(self.predicted_order)
@@ -479,6 +487,7 @@ def analyze_run(
     min_dwell: int = 2,
     predicted_order: Optional[Sequence[int]] = None,
     excluded_spans: Sequence[int] = (),
+    predicted_degenerate: bool = False,
 ) -> RunPhases:
     """Reconstruct the head-specialization story for one run's history frame.
 
@@ -531,6 +540,7 @@ def analyze_run(
         observed_order=observed_order,
         predicted_order=list(predicted_order) if predicted_order is not None else [],
         excluded_spans=list(excluded_spans),
+        predicted_degenerate=predicted_degenerate,
     )
 
 
@@ -708,13 +718,18 @@ def phase_table(
     for run_id, run_df in df.groupby("_run_id", dropna=False):
         cfg = run_df.iloc[0].to_dict()
         excluded = skip_connection_spans(cfg, num_spans)
-        predicted, lag_weights = None, None
+        predicted, lag_weights, degenerate = None, None, False
         if use_config_prediction:
             try:
                 lag_weights = lag_weights_from_config(cfg, num_spans)
                 predicted = predicted_span_order(cfg, num_spans, exclude=excluded)
+                # A flat law (alpha == 0, or `law: flat`) ties every span, so the
+                # stable argsort's tie-break is not a prediction. Score it as
+                # undefined instead of crediting an arbitrary order.
+                comparable = [lag_weights[k] for k in predicted]
+                degenerate = len(set(comparable)) < len(comparable)
             except Exception:  # config shape varies across older runs
-                predicted, lag_weights = None, None
+                predicted, lag_weights, degenerate = None, None, False
 
         phases = analyze_run(
             run_df,
@@ -730,6 +745,7 @@ def phase_table(
             min_dwell=min_dwell,
             predicted_order=predicted,
             excluded_spans=excluded,
+            predicted_degenerate=degenerate,
         )
 
         row: Dict[str, Any] = {
@@ -757,6 +773,7 @@ def phase_table(
         row["uncovered_spans"] = phases.uncovered_spans
         row["observed_order"] = [phases.span_labels[k] for k in phases.observed_order]
         row["excluded"] = [phases.span_labels[k] for k in phases.excluded_spans]
+        row["predicted_degenerate"] = phases.predicted_degenerate
         row["predicted_order"] = [phases.span_labels[k] for k in phases.predicted_order]
         row["order_matches"] = phases.order_matches_importance
         row["order_rank_corr"] = phases.order_rank_corr

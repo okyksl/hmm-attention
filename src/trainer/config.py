@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 import torch
 import wandb
@@ -51,8 +51,12 @@ class LoggingConfig:
     #   "sgd"        — persistent Adam update per training step. Hooks installed
     #                  permanently; per-step cost is minimal. Best for
     #                  high-frequency probing.
-    # `probe_offsets=None` → derive `[-base_teacher.context_length, ..., +1]`
-    # from the teacher at first-use (adaptive to the AR window).
+    # `probe_offsets=None` + `probe_offset_mode="auto"` uses a shared
+    # surface-token horizon: full teacher context for retention and one
+    # top-level unit for planning. Lower levels therefore receive more k's.
+    # A flat explicit list broadcasts to every level; a nested list configures
+    # each level independently. `probe_offset_mode="legacy"` restores the old
+    # common `[-base_teacher.context_length, ..., +1]` range.
     # `probe_sharing` selects whether slots share one linear readout or fit
     # independent readouts: "shared" | "per_slot".
     # `probe_slot_mode` selects the reported phase resolution:
@@ -60,7 +64,8 @@ class LoggingConfig:
     #   "coarse"  — only the immediate-child slot (legacy behavior).
     probe_mode: str = "off"
     probe_frequency: int = 100
-    probe_offsets: Optional[List[int]] = None
+    probe_offsets: Optional[Union[List[int], List[List[int]]]] = None
+    probe_offset_mode: str = "auto"
     probe_sharing: str = "shared"
     probe_slot_mode: str = "surface"
     probe_max_iters: int = 20
