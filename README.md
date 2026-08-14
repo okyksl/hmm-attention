@@ -41,6 +41,22 @@ Run from the `torch` conda env or with `uv`:
 ```bash
 uv run python train.py experiments=multilevel_dissection
 uv run python -m pytest
+```
+
+Training checkpoints are content-addressed by the fully resolved config and
+automatically resume the same W&B run. To start one config over on a cluster,
+set a new non-null reset token in its config or Hydra overrides:
+
+```bash
+uv run python train.py experiments=multilevel_dissection misc.checkpoint.reset=restart-1
+```
+
+The first worker that owns that config removes its local checkpoint and
+completion marker, starts at step 0, and creates a new W&B run. The token is
+recorded separately, so cluster retries with the same value resume normally;
+use `restart-2` (and so on) for later resets. Remote W&B runs are never deleted
+by the code and remain yours to remove manually. Stop the old worker before
+resetting so it no longer owns the config lock.
 
 Teachers, chunk levels, base process, and probes are all configured under
 conf/ (see conf/experiments/ for worked examples).

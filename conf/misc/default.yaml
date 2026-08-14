@@ -30,6 +30,13 @@ checkpoint:
   # is stable across launches from the same working tree.
   enabled: true
   resume: true
+  # One-shot, non-interactive fresh-start generation. Leave null normally.
+  # Set to a new value (for example `restart-1`) to make the first worker that
+  # owns this config delete its local checkpoint + done marker before wandb
+  # initialization. The value is recorded separately from the checkpoint, so
+  # retries with the SAME value resume normally. Change it again for another
+  # fresh start. This never deletes the remote W&B run.
+  reset: null
   root: ${hydra:runtime.cwd}/outputs/checkpoints
   # Save every Nth log step. 1 = save on every log step (checkpoint step ==
   # last wandb-logged step, no history gap possible on resume). N > 1 saves

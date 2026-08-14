@@ -13,10 +13,15 @@ import torch
 from src.loss import CrossentropyLoss
 from src.trainer import LoggingConfig, NgramConfig, SchedulerConfig, SGDTrainer
 from src.trainer.checkpoint import (
+    CHECKPOINT_FILENAME,
+    RESET_TOKEN_FILENAME,
+    apply_checkpoint_reset,
     assert_config_matches,
+    checkpoint_config_hash,
     config_hash,
     is_stub_payload,
     load_checkpoint,
+    reset_token_applied,
     save_checkpoint,
 )
 
@@ -74,6 +79,44 @@ def test_config_hash_changes_with_values():
     a = {"lr": 0.01}
     b = {"lr": 0.02}
     assert config_hash(a) != config_hash(b)
+
+
+def test_checkpoint_hash_ignores_reset_token():
+    legacy = {"lr": 0.01, "misc": {"checkpoint": {"resume": True}}}
+    reset_1 = {
+        "lr": 0.01,
+        "misc": {"checkpoint": {"resume": True, "reset": "restart-1"}},
+    }
+    reset_2 = {
+        "lr": 0.01,
+        "misc": {"checkpoint": {"resume": True, "reset": "restart-2"}},
+    }
+    assert checkpoint_config_hash(legacy) == checkpoint_config_hash(reset_1)
+    assert checkpoint_config_hash(reset_1) == checkpoint_config_hash(reset_2)
+
+
+def test_checkpoint_hash_still_changes_with_training_config():
+    a = {"lr": 0.01, "misc": {"checkpoint": {"reset": "restart-1"}}}
+    b = {"lr": 0.02, "misc": {"checkpoint": {"reset": "restart-1"}}}
+    assert checkpoint_config_hash(a) != checkpoint_config_hash(b)
+
+
+def test_apply_checkpoint_reset_is_one_shot_and_preserves_unknown_files(tmp_path):
+    checkpoint = tmp_path / CHECKPOINT_FILENAME
+    checkpoint.write_bytes(b"checkpoint")
+    (tmp_path / "done").write_text("")
+    (tmp_path / "lock").write_text("worker")
+    unrelated = tmp_path / "notes.txt"
+    unrelated.write_text("keep me")
+
+    removed = apply_checkpoint_reset(tmp_path, "restart-1")
+
+    assert set(removed) == {checkpoint, tmp_path / "done"}
+    assert reset_token_applied(tmp_path, "restart-1")
+    assert not reset_token_applied(tmp_path, "restart-2")
+    assert (tmp_path / RESET_TOKEN_FILENAME).exists()
+    assert (tmp_path / "lock").exists()
+    assert unrelated.read_text() == "keep me"
 
 
 def test_is_stub_payload_recognizes_stub():

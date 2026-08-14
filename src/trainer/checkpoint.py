@@ -18,7 +18,8 @@ Design (see conversation with the user for the full rationale):
 
 - **Config-drift protection**: `config_hash` is set on the initial checkpoint
   and asserted on resume. Prevents accidental cross-experiment contamination
-  in the same wandb run.
+  in the same wandb run. ``misc.checkpoint.reset`` is excluded because it is
+  an operation on an existing identity, not part of the training identity.
 """
 
 import hashlib
@@ -26,6 +27,7 @@ import json
 import logging
 import os
 import random
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -33,6 +35,7 @@ import numpy as np
 import torch
 
 CHECKPOINT_FILENAME = "checkpoint.pt"
+RESET_TOKEN_FILENAME = "reset-token"
 
 
 def config_hash(cfg_container: Any) -> str:
@@ -43,6 +46,60 @@ def config_hash(cfg_container: Any) -> str:
     """
     payload = json.dumps(cfg_container, sort_keys=True, default=str)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def checkpoint_config_hash(cfg_container: Any) -> str:
+    """Hash training identity while excluding the one-shot reset token.
+
+    ``misc.checkpoint.reset`` controls what to do with an existing identity;
+    it is not part of that identity. Removing it also keeps hashes compatible
+    with checkpoints created before the reset option existed.
+    """
+    identity = deepcopy(cfg_container)
+    try:
+        identity["misc"]["checkpoint"].pop("reset", None)
+    except (KeyError, TypeError, AttributeError):
+        pass
+    return config_hash(identity)
+
+
+def _serialized_reset_token(token: Any) -> str:
+    return json.dumps(token, sort_keys=True, default=str)
+
+
+def reset_token_applied(ckpt_dir: Path, token: Any) -> bool:
+    """Return whether this reset generation was already applied."""
+    marker = ckpt_dir / RESET_TOKEN_FILENAME
+    try:
+        return marker.read_text() == _serialized_reset_token(token)
+    except FileNotFoundError:
+        return False
+
+
+def apply_checkpoint_reset(ckpt_dir: Path, token: Any) -> list[Path]:
+    """Clear resumable state and atomically record the applied generation.
+
+    The caller must hold the config's worker lock. The lock file and directory
+    are deliberately preserved so cleanup cannot race a newly-created lock
+    inode. Unknown files are also preserved.
+    """
+    targets = (
+        ckpt_dir / CHECKPOINT_FILENAME,
+        ckpt_dir / f"{CHECKPOINT_FILENAME}.tmp",
+        ckpt_dir / "done",
+        ckpt_dir / "done.tmp",
+    )
+    removed = []
+    for path in targets:
+        if path.exists():
+            path.unlink()
+            removed.append(path)
+
+    marker = ckpt_dir / RESET_TOKEN_FILENAME
+    tmp = ckpt_dir / f"{RESET_TOKEN_FILENAME}.tmp"
+    tmp.write_text(_serialized_reset_token(token))
+    os.replace(tmp, marker)
+    return removed
 
 
 def _rng_state() -> Dict[str, Any]:
@@ -179,8 +236,8 @@ def assert_config_matches(payload: Dict[str, Any], current_hash: str) -> None:
     """Hard-fail if the resolved config has drifted since the checkpoint.
 
     Prevents the "half the metrics are from experiment A, half from B in the
-    same wandb run" failure mode. User can override by deleting the
-    checkpoint file (which starts a fresh wandb run).
+    same wandb run" failure mode. Start fresh by assigning a new non-null
+    ``misc.checkpoint.reset`` token.
     """
     saved = payload.get("config_hash")
     if saved is None:
@@ -191,5 +248,5 @@ def assert_config_matches(payload: Dict[str, Any], current_hash: str) -> None:
             "Config hash mismatch: cannot resume this checkpoint into a "
             "modified config (would contaminate the wandb run with mixed "
             f"metrics). Saved hash: {saved[:12]}, current: {current_hash[:12]}. "
-            "Delete the checkpoint file to start fresh."
+            "Set a new misc.checkpoint.reset token to start fresh."
         )

@@ -14,9 +14,11 @@ from src.runner.verbose import log_student_summary, log_teacher_summary
 from src.trainer import LoggingConfig, NgramConfig, SchedulerConfig, Trainer
 from src.trainer.checkpoint import (
     CHECKPOINT_FILENAME,
+    apply_checkpoint_reset,
     assert_config_matches,
-    config_hash,
+    checkpoint_config_hash,
     load_checkpoint,
+    reset_token_applied,
 )
 from src.trainer import lock as work_lock
 
@@ -162,10 +164,11 @@ def get_trainer(cfg: DictConfig) -> Optional[Trainer]:
     ckpt_cfg = cfg.misc.get("checkpoint", {})
     ckpt_enabled = ckpt_cfg.get("enabled", True)
     resume_enabled = ckpt_cfg.get("resume", True)
+    reset_token = ckpt_cfg.get("reset", None)
     ckpt_root = Path(ckpt_cfg.get("root", "outputs/checkpoints"))
 
     cfg_container = OmegaConf.to_container(cfg, resolve=True, throw_on_missing=True)
-    current_cfg_hash = config_hash(cfg_container)
+    current_cfg_hash = checkpoint_config_hash(cfg_container)
 
     checkpoint_path: Optional[Path] = None
     ckpt_dir: Optional[Path] = None
@@ -176,11 +179,22 @@ def get_trainer(cfg: DictConfig) -> Optional[Trainer]:
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         checkpoint_path = ckpt_dir / CHECKPOINT_FILENAME
 
+    # A non-null reset token is a one-shot generation: the first worker to see
+    # a new value clears this identity's checkpoint + done marker. The applied
+    # token remains on disk, so cluster retries with the same config resume the
+    # new run instead of repeatedly starting over. Bump the token for another
+    # intentional restart. Remote W&B state is never touched here.
+    reset_pending = (
+        ckpt_dir is not None
+        and reset_token is not None
+        and not reset_token_applied(ckpt_dir, reset_token)
+    )
+
     # Work coordination: bail out BEFORE wandb.init if this config is either
-    # already completed or claimed by a live worker. Skipping here means we
-    # never create an orphan wandb run for a config someone else owns.
+    # already completed or claimed by a live worker. A pending reset bypasses
+    # the done check but still must own the same worker lock.
     if ckpt_dir is not None:
-        if work_lock.is_completed(ckpt_dir):
+        if not reset_pending and work_lock.is_completed(ckpt_dir):
             logging.getLogger().info(
                 f"Config {current_cfg_hash[:16]} already completed; skipping."
             )
@@ -191,6 +205,28 @@ def get_trainer(cfg: DictConfig) -> Optional[Trainer]:
                 "worker; skipping."
             )
             return None
+
+        # Re-check after acquiring in case reset coordination changes in a
+        # future blocking-lock implementation.
+        if reset_pending and not reset_token_applied(ckpt_dir, reset_token):
+            previous_wandb_id = None
+            if checkpoint_path is not None and checkpoint_path.exists():
+                try:
+                    old_payload = load_checkpoint(
+                        checkpoint_path, torch.device("cpu")
+                    )
+                    previous_wandb_id = old_payload.get("wandb_run_id")
+                except Exception as exc:
+                    logging.getLogger().warning(
+                        f"Could not read checkpoint metadata before reset: {exc}"
+                    )
+            removed = apply_checkpoint_reset(ckpt_dir, reset_token)
+            logging.getLogger().warning(
+                f"Applied checkpoint reset token {reset_token!r} to "
+                f"{ckpt_dir}; removed {[p.name for p in removed]}. "
+                f"Previous W&B run id: {previous_wandb_id or 'unavailable'}. "
+                "Remote W&B state was not changed."
+            )
 
     resume_payload: Optional[Dict[str, Any]] = None
     resume_wandb_id: Optional[str] = None
